@@ -16,18 +16,27 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 
 log = logging.getLogger("worker-db")
 
-DEFAULT_DATABASE_URL = "postgresql+psycopg2://app_user:app_password@postgres:5432/app_db"
 TMDB_ITEM_RE = re.compile(r"^tmdb_(?:movie|tv)_(\d+)$", re.IGNORECASE)
 
 _engine: Engine | None = None
 
 
 def database_url() -> str:
-    return os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL environment variable is required")
+    return url
+
+
+def database_url_masked() -> str | None:
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        return None
+    return make_url(url).render_as_string(hide_password=True)
 
 
 def get_engine() -> Engine:

@@ -30,7 +30,7 @@ from service_persistence import (
 from train_config_loader import load_train_config_file, train_config_from_file
 from trainer_runner import TrainConfig, run_training_phase_a
 from worker_db import (
-    database_url,
+    database_url_masked,
     fetch_interaction_count,
     fetch_pending_users,
     fetch_user_ratings,
@@ -537,7 +537,7 @@ async def health() -> dict[str, Any]:
         "queued_users": state.refresh_queue.qsize(),
         "known_user_vectors": len(state.user_vectors),
         "db_poll_interval_sec": DB_POLL_INTERVAL,
-        "database_url": database_url().replace("app_password", "***"),
+        "database_url": database_url_masked(),
         "retrain_threshold": RETRAIN_THRESHOLD,
         "retrain_check_interval_sec": RETRAIN_CHECK_INTERVAL,
         "retrain_running": state.retrain_running,

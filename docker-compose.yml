@@ -12,7 +12,7 @@ services:
     environment:
       RECOM_ARTIFACT_DIR: ${RECOM_ARTIFACT_DIR}
       WORKER_STATE_DIR: /app/data/worker_state
-      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://app_user:app_password@postgres:5432/app_db}
+      DATABASE_URL: ${DATABASE_URL}
       RECOMMENDER_URL: http://recommender:8001
       DB_POLL_INTERVAL_SECONDS: ${DB_POLL_INTERVAL_SECONDS:-30}
       RETRAIN_THRESHOLD: ${RETRAIN_THRESHOLD:-0}
