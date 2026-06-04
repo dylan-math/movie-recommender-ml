@@ -10,14 +10,16 @@ services:
       - ./train_data:/app/train_data:ro
       - ./data:/app/data
     environment:
-      RECOM_ARTIFACT_DIR: ${RECOM_ARTIFACT_DIR}
+      # Container path (host ./artifacts mounted at /app/artifacts)
+      RECOM_ARTIFACT_DIR: /app/artifacts/registry/snap-phase-a-20260602T225455Z
       WORKER_STATE_DIR: /app/data/worker_state
       DATABASE_URL: ${DATABASE_URL}
       RECOMMENDER_URL: http://recommender:8001
       DB_POLL_INTERVAL_SECONDS: ${DB_POLL_INTERVAL_SECONDS:-30}
       RETRAIN_THRESHOLD: ${RETRAIN_THRESHOLD:-0}
       RETRAIN_CHECK_INTERVAL_SECONDS: ${RETRAIN_CHECK_INTERVAL_SECONDS:-60}
-      WORKER_PUSH_RECOMMENDER_ON_START: "1"
+      # Recommender restores vectors from ./data; skip 12k-user bulk push on every container start
+      WORKER_PUSH_RECOMMENDER_ON_START: "0"
       TRAIN_INTERACTIONS_PATH: ${TRAIN_INTERACTIONS_PATH:-/app/train_data/movielens/interactions.parquet}
       TRAIN_OUTPUT_ROOT: ${TRAIN_OUTPUT_ROOT:-/app/artifacts/registry}
       TRAIN_CONFIG_PATH: ${TRAIN_CONFIG_PATH:-/app/train_config.yaml}
@@ -37,10 +39,10 @@ services:
       - ./artifacts:/app/artifacts:ro
       - ./data:/app/data
     environment:
-      RECOM_ARTIFACT_DIR: ${RECOM_ARTIFACT_DIR}
+      RECOM_ARTIFACT_DIR: /app/artifacts/registry/snap-phase-a-20260602T225455Z
       RECOM_STATE_DIR: /app/data/recommender_state
       WORKER_URL: http://worker:8002
-      RECOM_SYNC_FROM_WORKER_ON_START: "1"
+      RECOM_SYNC_FROM_WORKER_ON_START: "0"
 
 networks:
   plotwise:
