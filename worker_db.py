@@ -6,10 +6,8 @@ Poll/retrain cursors live in ``WorkerState`` (RAM), not here.
 
 from __future__ import annotations
 
-import base64
 import logging
 import os
-import re
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -17,10 +15,9 @@ from typing import Any, Iterator
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, make_url
+from utils import normalize_bot_item_id
 
 log = logging.getLogger("worker-db")
-
-TMDB_ITEM_RE = re.compile(r"^tmdb_(?:movie|tv)_(\d+)$", re.IGNORECASE)
 
 _engine: Engine | None = None
 
@@ -52,19 +49,6 @@ def connect() -> Iterator[Any]:
         yield conn
 
 
-def decode_item_token(raw: str) -> str | None:
-    value = str(raw).strip()
-    if not value:
-        return None
-    if value.isdigit():
-        return value
-    try:
-        pad = (-len(value)) % 4
-        return base64.b64decode(value + ("=" * pad)).decode("utf-8")
-    except Exception:
-        return value
-
-
 def load_external_item_map(artifact_dir: Path | None) -> dict[str, int]:
     path_raw = os.getenv("ITEM_ID_MAP_PATH")
     paths: list[Path] = []
@@ -94,37 +78,9 @@ def load_external_item_map(artifact_dir: Path | None) -> dict[str, int]:
                 movie_id = int(row[movie_col])
             except (TypeError, ValueError):
                 continue
-            mapping[external] = movie_id
-            decoded = decode_item_token(external)
-            if decoded:
-                mapping[decoded] = movie_id
+            public_id = normalize_bot_item_id(external) or external
+            mapping[public_id] = movie_id
     return mapping
-
-
-def resolve_movie_id(
-    raw_item_id: object,
-    *,
-    movie_id_to_idx: dict[int, int],
-    external_map: dict[str, int],
-) -> int | None:
-    token = str(raw_item_id).strip()
-    candidates = [token]
-    decoded = decode_item_token(token)
-    if decoded and decoded not in candidates:
-        candidates.append(decoded)
-    for candidate in candidates:
-        if candidate in external_map:
-            movie_id = external_map[candidate]
-            if movie_id in movie_id_to_idx:
-                return movie_id
-        if candidate.isdigit():
-            movie_id = int(candidate)
-            if movie_id in movie_id_to_idx:
-                return movie_id
-        match = TMDB_ITEM_RE.match(candidate)
-        if match and int(match.group(1)) in movie_id_to_idx:
-            return int(match.group(1))
-    return None
 
 
 def fetch_user_ratings(user_id: str) -> list[tuple[str, float]]:

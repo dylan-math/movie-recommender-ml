@@ -7,7 +7,7 @@ services:
       - "8002:8002"
     volumes:
       - ./artifacts:/app/artifacts:ro
-      - ./train_data:/app/train_data:ro
+      - ./train_data:/app/train_data
       - ./data:/app/data
     environment:
       # Container path (host ./artifacts mounted at /app/artifacts)
@@ -24,6 +24,12 @@ services:
       TRAIN_OUTPUT_ROOT: ${TRAIN_OUTPUT_ROOT:-/app/artifacts/registry}
       TRAIN_CONFIG_PATH: ${TRAIN_CONFIG_PATH:-/app/train_config.yaml}
       CUDA_PATH: /usr
+      TMDB_API_KEY: ${TMDB_API_KEY}
+      TMDB_EXPORT_DIR: ${TMDB_EXPORT_DIR:-/app/train_data/tmdb/exports}
+      TMDB_CATALOG_SYNC_ENABLED: ${TMDB_CATALOG_SYNC_ENABLED:-0}
+      TMDB_CATALOG_SYNC_INTERVAL_SECONDS: ${TMDB_CATALOG_SYNC_INTERVAL_SECONDS:-86400}
+      TMDB_CATALOG_SYNC_ON_START: ${TMDB_CATALOG_SYNC_ON_START:-1}
+      TMDB_CATALOG_BASE_ARTIFACT: /app/artifacts/registry/snap-phase-a-20260602T225455Z
     networks:
       - default
       - plotwise

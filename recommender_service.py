@@ -35,11 +35,11 @@ def utc_now_iso() -> str:
 class RecommendRequest(BaseModel):
     user_id: int | str
     n: int = Field(default=10, ge=1, le=100)
-    seen_item_ids: list[int] = Field(default_factory=list)
+    seen_item_ids: list[str] = Field(default_factory=list)
 
 
 class RecommendItem(BaseModel):
-    item_id: int
+    item_id: str
     score: float
 
 
@@ -61,6 +61,7 @@ class UsersSyncRequest(BaseModel):
 
 class ActivateRequest(BaseModel):
     artifact_dir: str | None = None
+    reset_user_vectors: bool = False
 
 
 @dataclass
@@ -190,9 +191,9 @@ class RecommenderState:
             scores = bundle.global_mean + bundle.item_factors @ record.vector
             scores = scores.copy()
             seen_indices = [
-                bundle.movie_id_to_idx[movie_id]
-                for movie_id in request.seen_item_ids
-                if movie_id in bundle.movie_id_to_idx
+                bundle.item_id_to_idx[str(item_id)]
+                for item_id in request.seen_item_ids
+                if str(item_id) in bundle.item_id_to_idx
             ]
             if seen_indices:
                 scores[seen_indices] = -np.inf
@@ -205,7 +206,7 @@ class RecommenderState:
             top_idx = top_idx[np.argsort(-scores[top_idx])]
             items = [
                 RecommendItem(
-                    item_id=int(bundle.movie_ids[idx]),
+                    item_id=str(bundle.movie_ids[idx]),
                     score=round(float(scores[idx]), 2),
                 )
                 for idx in top_idx
@@ -317,8 +318,15 @@ def sync_users(request: UsersSyncRequest) -> dict[str, Any]:
 
 @app.post("/v1/admin/model/activate")
 def activate_model(request: ActivateRequest) -> dict[str, Any]:
-    bundle = state.load_bundle(request.artifact_dir)
-    return {"status": "activated", "model_version": bundle.model_version, "artifact_dir": str(bundle.artifact_dir)}
+    bundle = state.load_bundle(request.artifact_dir, reset_vectors=request.reset_user_vectors)
+    return {
+        "status": "activated",
+        "model_version": bundle.model_version,
+        "artifact_dir": str(bundle.artifact_dir),
+        "item_id_format": bundle.item_id_format,
+        "n_items": len(bundle.item_id_to_idx),
+        "reset_user_vectors": request.reset_user_vectors,
+    }
 
 
 @app.post("/v1/admin/sync-from-worker")

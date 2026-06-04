@@ -60,7 +60,17 @@ class ArtifactBundle:
     item_factors: np.ndarray
     movie_ids: np.ndarray
     movie_metadata: pd.DataFrame
-    movie_id_to_idx: dict[int, int]
+    item_id_format: str
+    item_id_to_idx: dict[str, int]
+
+    @property
+    def movie_id_to_idx(self) -> dict[int, int]:
+        """Legacy MovieLens int index (empty for plotwise_tmdb catalogs)."""
+        out: dict[int, int] = {}
+        for key, idx in self.item_id_to_idx.items():
+            if key.isdigit():
+                out[int(key)] = idx
+        return out
 
 
 def load_artifact_bundle(artifact_dir: str | Path | None = None) -> ArtifactBundle:
@@ -76,12 +86,24 @@ def load_artifact_bundle(artifact_dir: str | Path | None = None) -> ArtifactBund
         raise ValueError(f"Unsupported model_type: {config.get('model_type')}")
 
     item_factors = np.load(target_dir / "item_factors.npy")
-    movie_ids = np.load(target_dir / "movie_ids.npy")
+    movie_ids = np.load(target_dir / "movie_ids.npy", allow_pickle=True)
     movie_metadata = pd.read_csv(target_dir / "movie_metadata.csv")
     if "movieId" not in movie_metadata.columns and "index" in movie_metadata.columns:
         movie_metadata = movie_metadata.rename(columns={"index": "movieId"})
 
-    movie_id_to_idx = {int(movie_id): int(idx) for idx, movie_id in enumerate(movie_ids)}
+    flat = np.asarray(movie_ids).reshape(-1)
+    item_id_format = str(config.get("item_id_format", ""))
+    if not item_id_format:
+        item_id_format = "plotwise_tmdb" if flat.dtype.kind in ("U", "S") or flat.dtype == object else "movielens_int"
+
+    item_id_to_idx: dict[str, int] = {}
+    for idx, raw in enumerate(flat):
+        if isinstance(raw, (np.integer, int)):
+            key = str(int(raw))
+        else:
+            key = str(raw)
+        item_id_to_idx[key] = int(idx)
+
     model_version = str(config.get("model_version") or config.get("trained_at") or target_dir.name)
 
     return ArtifactBundle(
@@ -91,10 +113,33 @@ def load_artifact_bundle(artifact_dir: str | Path | None = None) -> ArtifactBund
         regularization=float(config["regularization"]),
         global_mean=float(config["global_mean"]),
         item_factors=item_factors.astype(np.float32),
-        movie_ids=movie_ids,
+        movie_ids=flat,
         movie_metadata=movie_metadata,
-        movie_id_to_idx=movie_id_to_idx,
+        item_id_format=item_id_format,
+        item_id_to_idx=item_id_to_idx,
     )
+
+
+def resolve_item_index(
+    bundle: ArtifactBundle,
+    raw_item_id: object,
+    *,
+    external_map: dict[str, int] | None = None,
+) -> int | None:
+    """Map plotwise token / legacy id to row index in item_factors."""
+    from utils import normalize_bot_item_id
+
+    token = normalize_bot_item_id(str(raw_item_id))
+    if token is None:
+        token = str(raw_item_id).strip()
+    if token in bundle.item_id_to_idx:
+        return bundle.item_id_to_idx[token]
+    if external_map and token in external_map:
+        legacy = str(external_map[token])
+        return bundle.item_id_to_idx.get(legacy)
+    if token.isdigit():
+        return bundle.item_id_to_idx.get(token)
+    return None
 
 
 def fit_user_vector(
