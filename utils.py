@@ -32,12 +32,16 @@ def decode_my_id_into_tmdb_id(
 	internal_id = _from_public_id(my_id)
 	if not internal_id:
 		return None
-	
-	_, media_type, tmdb_id = internal_id.split('_')
+	parts = internal_id.split("_")
+	if len(parts) != 3 or parts[0] != PREFIX:
+		return None
+	_, media_type, tmdb_id_raw = parts
 	if media_type not in ("tv", "movie"):
 		return None
-
-	return int(tmdb_id), media_type
+	try:
+		return int(tmdb_id_raw), media_type
+	except ValueError:
+		return None
 
 
 def normalize_bot_item_id(raw: str) -> Optional[str]:
