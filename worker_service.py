@@ -19,14 +19,8 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from als_runtime import (
-    ArtifactBundle,
-    fit_user_vector,
-    load_artifact_bundle,
-    load_user_ids_npy,
-    resolve_item_index,
-    user_id_key,
-)
+from als_runtime import ArtifactBundle, fit_user_vector, load_user_ids_npy, user_id_key
+from plotwise_catalog import PlotwiseItemCatalog, load_plotwise_catalog
 from service_persistence import (
     PersistedUserVector,
     load_active_model_pointer,
@@ -111,7 +105,7 @@ class UserVectorRecord:
 
 class WorkerState:
     def __init__(self) -> None:
-        self.bundle: ArtifactBundle | None = None
+        self.catalog: PlotwiseItemCatalog | None = None
         self.user_vectors: dict[str, UserVectorRecord] = {}
         self.pending_deadline: dict[str, float] = {}
         self.enqueued: set[str] = set()
@@ -130,18 +124,18 @@ class WorkerState:
         self.last_catalog_sync_at: str | None = None
         self.last_catalog_snap_dir: str | None = None
 
-    def load_bundle(self, artifact_dir: str | Path | None = None) -> ArtifactBundle:
-        self.bundle = load_artifact_bundle(artifact_dir)
+    def load_catalog(self, artifact_dir: str | Path | None = None) -> PlotwiseItemCatalog:
+        self.catalog = load_plotwise_catalog(artifact_dir)
         save_active_model_pointer(
             self.state_dir,
-            artifact_dir=str(self.bundle.artifact_dir),
-            model_version=self.bundle.model_version,
+            artifact_dir=str(self.catalog.artifact_dir),
+            model_version=self.catalog.model_version,
         )
-        return self.bundle
+        return self.catalog
 
     def persist_user_vectors(self) -> None:
-        bundle = self.bundle
-        if bundle is None:
+        catalog = self.catalog
+        if catalog is None:
             return
         records = {
             uid: PersistedUserVector(
@@ -152,13 +146,13 @@ class WorkerState:
             )
             for uid, rec in self.user_vectors.items()
         }
-        save_user_vectors(self.state_dir, model_version=bundle.model_version, records=records)
+        save_user_vectors(self.state_dir, model_version=catalog.model_version, records=records)
 
     def restore_user_vectors_from_disk(self) -> int:
         model_version, records = load_user_vectors(self.state_dir)
-        if not records or self.bundle is None:
+        if not records or self.catalog is None:
             return 0
-        if model_version != self.bundle.model_version:
+        if model_version != self.catalog.model_version:
             return 0
         for uid, persisted in records.items():
             self.user_vectors[uid] = UserVectorRecord(
@@ -220,15 +214,18 @@ async def acknowledge_retrain_checkpoint() -> None:
 
 
 def project_known_items(
-    bundle: ArtifactBundle,
+    catalog: PlotwiseItemCatalog,
     ratings: list[tuple[str, float]],
     *,
     external_map: dict[str, int],
+    register_unknown: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
+    if register_unknown:
+        catalog.ensure_items((item_id for item_id, _ in ratings), external_map=external_map)
     item_indices: list[int] = []
     values: list[float] = []
     for item_id, rating in ratings:
-        idx = resolve_item_index(bundle, item_id, external_map=external_map)
+        idx = catalog.resolve_index(item_id, external_map=external_map)
         if idx is None:
             continue
         item_indices.append(int(idx))
@@ -266,25 +263,67 @@ async def push_user_vector(client: httpx.AsyncClient, user_id: str, record: User
     await push_user_vectors_batch(client, model_version=record.model_version, users=[(user_id, record)])
 
 
+async def push_plotwise_items_batch(
+    client: httpx.AsyncClient,
+    *,
+    model_version: str,
+    items: list[tuple[str, int]],
+) -> None:
+    catalog = state.catalog
+    if catalog is None or not items:
+        return
+    payload = {
+        "model_version": model_version,
+        "items": [
+            {
+                "item_id": item_id,
+                "item_vector": catalog.item_factors[idx].tolist(),
+            }
+            for item_id, idx in items
+        ],
+    }
+    response = await client.post(
+        f"{RECOMMENDER_URL.rstrip('/')}/v1/internal/items/append",
+        json=payload,
+        timeout=60.0,
+    )
+    response.raise_for_status()
+
+
 async def process_refresh_user(user_id: str, client: httpx.AsyncClient) -> None:
-    bundle = state.bundle
-    if bundle is None:
-        raise RuntimeError("Bundle is not loaded.")
+    catalog = state.catalog
+    if catalog is None:
+        raise RuntimeError("Plotwise item catalog is not loaded.")
 
     raw_ratings = await asyncio.to_thread(fetch_user_ratings, user_id)
+    async with state.lock:
+        new_items = catalog.ensure_items(
+            (item_id for item_id, _ in raw_ratings),
+            external_map=state.external_item_map,
+        )
+        if new_items:
+            catalog.persist()
+    if new_items:
+        await push_plotwise_items_batch(
+            client,
+            model_version=catalog.model_version,
+            items=new_items,
+        )
+
     item_indices, rating_values = project_known_items(
-        bundle,
+        catalog,
         raw_ratings,
         external_map=state.external_item_map,
+        register_unknown=False,
     )
     if item_indices.size == 0:
-        log.debug("refresh skip user_id=%s: no ratings in model catalog", user_id)
+        log.debug("refresh skip user_id=%s: no usable ratings", user_id)
         return
 
     vector = fit_user_vector(
-        item_factors=bundle.item_factors,
-        global_mean=bundle.global_mean,
-        regularization=bundle.regularization,
+        item_factors=catalog.item_factors,
+        global_mean=catalog.global_mean,
+        regularization=catalog.regularization,
         item_indices=item_indices,
         ratings_values=rating_values,
     )
@@ -292,7 +331,7 @@ async def process_refresh_user(user_id: str, client: httpx.AsyncClient) -> None:
         vector=vector,
         stale=False,
         updated_at=utc_now_iso(),
-        model_version=bundle.model_version,
+        model_version=catalog.model_version,
     )
     async with state.lock:
         state.user_vectors[user_id] = record
@@ -355,8 +394,8 @@ async def _execute_catalog_sync(*, download: bool = True) -> dict[str, Any]:
         links_csv=links,
         download=download,
     )
-    bundle = state.load_bundle(str(result.snap_dir))
-    state.external_item_map = load_external_item_map(bundle.artifact_dir)
+    catalog = state.load_catalog(str(result.snap_dir))
+    state.external_item_map = load_external_item_map(catalog.artifact_dir)
     async with httpx.AsyncClient() as client:
         recommender_payload = await client.post(
             f"{RECOMMENDER_URL.rstrip('/')}/v1/admin/model/activate",
@@ -370,7 +409,7 @@ async def _execute_catalog_sync(*, download: bool = True) -> dict[str, Any]:
     return {
         "snap_dir": str(result.snap_dir),
         "n_items": result.n_items,
-        "model_version": bundle.model_version,
+        "model_version": catalog.model_version,
         "recommender": rec_json,
     }
 
@@ -469,27 +508,34 @@ def _bulk_load_user_vectors(bundle: ArtifactBundle) -> dict[str, UserVectorRecor
 
 
 async def push_all_vectors_to_recommender(client: httpx.AsyncClient) -> dict[str, Any]:
-    bundle = state.bundle
-    if bundle is None:
-        raise RuntimeError("Bundle is not loaded.")
+    catalog = state.catalog
+    if catalog is None:
+        raise RuntimeError("Plotwise item catalog is not loaded.")
 
     response = await client.post(
         f"{RECOMMENDER_URL.rstrip('/')}/v1/admin/model/activate",
-        json={"artifact_dir": str(bundle.artifact_dir)},
+        json={"artifact_dir": str(catalog.artifact_dir)},
         timeout=20.0,
     )
     response.raise_for_status()
 
     async with state.lock:
         users = list(state.user_vectors.items())
+    if catalog._overlay_ids:
+        overlay_pairs = [(item_id, catalog.item_id_to_idx[item_id]) for item_id in catalog._overlay_ids]
+        await push_plotwise_items_batch(
+            client,
+            model_version=catalog.model_version,
+            items=overlay_pairs,
+        )
 
     pushed = 0
     for offset in range(0, len(users), USER_VECTOR_SYNC_BATCH):
         batch = users[offset : offset + USER_VECTOR_SYNC_BATCH]
-        await push_user_vectors_batch(client, model_version=bundle.model_version, users=batch)
+        await push_user_vectors_batch(client, model_version=catalog.model_version, users=batch)
         pushed += len(batch)
 
-    return {"model_version": bundle.model_version, "users_pushed": pushed}
+    return {"model_version": catalog.model_version, "users_pushed": pushed}
 
 
 async def start_retrain_job(request: RetrainRequest, *, mark_running: bool = False) -> str:
@@ -535,10 +581,10 @@ async def retrain_job(job_id: str, request: RetrainRequest) -> None:
 
         status.status = "activating"
         status.updated_at = utc_now_iso()
-        bundle = state.load_bundle(str(train_result.output_dir))
+        catalog = state.load_catalog(str(train_result.output_dir))
 
         async with state.lock:
-            state.user_vectors = _bulk_load_user_vectors(bundle)
+            state.user_vectors = _bulk_load_user_vectors(catalog.base)
         state.persist_user_vectors()
 
         async with httpx.AsyncClient() as client:
@@ -546,7 +592,7 @@ async def retrain_job(job_id: str, request: RetrainRequest) -> None:
             await acknowledge_retrain_checkpoint()
 
         status.status = "completed"
-        status.model_version = bundle.model_version
+        status.model_version = catalog.model_version
         status.detail = (
             f"trained users={train_result.n_users} items={train_result.n_items} "
             f"interactions={train_result.n_interactions}; pushed={payload['users_pushed']}"
@@ -567,16 +613,20 @@ async def startup() -> None:
     pointer = load_active_model_pointer(state.state_dir)
     if artifact_dir is None and pointer is not None:
         artifact_dir = pointer.get("artifact_dir")
-    bundle = state.load_bundle(artifact_dir)
-    state.external_item_map = load_external_item_map(bundle.artifact_dir)
+    catalog = state.load_catalog(artifact_dir)
+    state.external_item_map = load_external_item_map(catalog.artifact_dir)
     if state.external_item_map:
         log.info("Loaded %s external item_id mappings", len(state.external_item_map))
+    log.info(
+        "Plotwise item data: %s base items, %s overlay items",
+        catalog.base.item_factors.shape[0],
+        catalog.overlay_count,
+    )
 
     restored = state.restore_user_vectors_from_disk()
     if restored == 0:
-        bundle = state.bundle
-        if bundle is not None:
-            state.user_vectors = _bulk_load_user_vectors(bundle)
+        if state.catalog is not None:
+            state.user_vectors = _bulk_load_user_vectors(state.catalog.base)
             state.persist_user_vectors()
             log.info("Hydrated %s user vectors from training bundle", len(state.user_vectors))
     else:
@@ -619,14 +669,15 @@ async def shutdown() -> None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    bundle = state.bundle
+    catalog = state.catalog
     train_cfg = load_train_config_file()
     return {
         "status": "ok",
-        "model_version": None if bundle is None else bundle.model_version,
-        "artifact_dir": None if bundle is None else str(bundle.artifact_dir),
-        "item_id_format": None if bundle is None else bundle.item_id_format,
-        "n_items": None if bundle is None else len(bundle.item_id_to_idx),
+        "model_version": None if catalog is None else catalog.model_version,
+        "artifact_dir": None if catalog is None else str(catalog.artifact_dir),
+        "item_id_format": None if catalog is None else catalog.item_id_format,
+        "n_items": None if catalog is None else len(catalog.item_id_to_idx),
+        "plotwise_overlay_items": None if catalog is None else catalog.overlay_count,
         "queued_users": state.refresh_queue.qsize(),
         "known_user_vectors": len(state.user_vectors),
         "db_poll_interval_sec": DB_POLL_INTERVAL,
@@ -653,16 +704,17 @@ async def health() -> dict[str, Any]:
 
 @app.get("/v1/internal/model")
 async def get_model() -> dict[str, Any]:
-    bundle = state.bundle
-    if bundle is None:
+    catalog = state.catalog
+    if catalog is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     return {
-        "model_version": bundle.model_version,
-        "artifact_dir": str(bundle.artifact_dir),
-        "factors": bundle.factors,
-        "global_mean": bundle.global_mean,
-        "regularization": bundle.regularization,
-        "n_items": int(bundle.item_factors.shape[0]),
+        "model_version": catalog.model_version,
+        "artifact_dir": str(catalog.artifact_dir),
+        "factors": catalog.factors,
+        "global_mean": catalog.global_mean,
+        "regularization": catalog.regularization,
+        "n_items": int(catalog.item_factors.shape[0]),
+        "plotwise_overlay_items": catalog.overlay_count,
         "known_user_vectors": len(state.user_vectors),
     }
 
@@ -671,8 +723,8 @@ async def get_model() -> dict[str, Any]:
 async def get_user_vector(user_id: str) -> dict[str, Any]:
     async with state.lock:
         record = state.user_vectors.get(str(user_id))
-        bundle = state.bundle
-    if record is None or bundle is None:
+        catalog = state.catalog
+    if record is None or catalog is None:
         raise HTTPException(status_code=404, detail=f"No vector for user_id={user_id}")
     return {
         "user_id": user_id,
@@ -727,8 +779,8 @@ async def catalog_sync_local() -> dict[str, Any]:
         tv_export=tv_files[0],
         download=False,
     )
-    bundle = state.load_bundle(str(result.snap_dir))
-    state.external_item_map = load_external_item_map(bundle.artifact_dir)
+    catalog = state.load_catalog(str(result.snap_dir))
+    state.external_item_map = load_external_item_map(catalog.artifact_dir)
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{RECOMMENDER_URL.rstrip('/')}/v1/admin/model/activate",
@@ -742,7 +794,7 @@ async def catalog_sync_local() -> dict[str, Any]:
     return {
         "snap_dir": str(result.snap_dir),
         "n_items": result.n_items,
-        "model_version": bundle.model_version,
+        "model_version": catalog.model_version,
         "recommender": rec_json,
     }
 
@@ -750,12 +802,12 @@ async def catalog_sync_local() -> dict[str, Any]:
 @app.post("/v1/admin/model/activate")
 async def activate_model(request: ActivateModelRequest) -> dict[str, Any]:
     """Load item catalog snap on Worker and activate same bundle on Recommender (no bulk user push)."""
-    bundle = state.load_bundle(request.artifact_dir)
+    catalog = state.load_catalog(request.artifact_dir)
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{RECOMMENDER_URL.rstrip('/')}/v1/admin/model/activate",
             json={
-                "artifact_dir": str(bundle.artifact_dir),
+                "artifact_dir": str(catalog.artifact_dir),
                 "reset_user_vectors": request.reset_user_vectors,
             },
             timeout=120.0,
@@ -764,10 +816,11 @@ async def activate_model(request: ActivateModelRequest) -> dict[str, Any]:
         payload = response.json()
     return {
         "status": "activated",
-        "model_version": bundle.model_version,
-        "artifact_dir": str(bundle.artifact_dir),
-        "item_id_format": bundle.item_id_format,
-        "n_items": len(bundle.item_id_to_idx),
+        "model_version": catalog.model_version,
+        "artifact_dir": str(catalog.artifact_dir),
+        "item_id_format": catalog.item_id_format,
+        "n_items": len(catalog.item_id_to_idx),
+        "plotwise_overlay_items": catalog.overlay_count,
         "recommender": payload,
     }
 
