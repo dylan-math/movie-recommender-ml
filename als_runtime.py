@@ -65,7 +65,7 @@ class ArtifactBundle:
 
     @property
     def movie_id_to_idx(self) -> dict[int, int]:
-        """Legacy MovieLens int index (empty for plotwise_tmdb catalogs)."""
+        """Legacy MovieLens int index (empty for plotwise string-id catalogs)."""
         out: dict[int, int] = {}
         for key, idx in self.item_id_to_idx.items():
             if key.isdigit():
@@ -94,7 +94,7 @@ def load_artifact_bundle(artifact_dir: str | Path | None = None) -> ArtifactBund
     flat = np.asarray(movie_ids).reshape(-1)
     item_id_format = str(config.get("item_id_format", ""))
     if not item_id_format:
-        item_id_format = "plotwise_tmdb" if flat.dtype.kind in ("U", "S") or flat.dtype == object else "movielens_int"
+        item_id_format = "plotwise" if flat.dtype.kind in ("U", "S") or flat.dtype == object else "movielens_int"
 
     item_id_to_idx: dict[str, int] = {}
     for idx, raw in enumerate(flat):

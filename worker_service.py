@@ -30,11 +30,6 @@ from service_persistence import (
 )
 from train_config_loader import load_train_config_file, train_config_from_file
 from trainer_runner import TrainConfig, run_training_phase_a
-from tmdb_catalog_sync import (
-    catalog_sync_enabled,
-    catalog_sync_interval_seconds,
-    run_catalog_sync,
-)
 from worker_db import (
     database_url_masked,
     fetch_interaction_count,
@@ -120,9 +115,6 @@ class WorkerState:
         # In-memory only: no raw interactions persisted (vectors go to service_persistence).
         self.poll_watermark: datetime | None = None
         self.retrain_interaction_checkpoint: int = 0
-        self.catalog_sync_running = False
-        self.last_catalog_sync_at: str | None = None
-        self.last_catalog_snap_dir: str | None = None
 
     def load_catalog(self, artifact_dir: str | Path | None = None) -> PlotwiseItemCatalog:
         self.catalog = load_plotwise_catalog(artifact_dir)
@@ -371,76 +363,6 @@ async def refresh_worker_loop() -> None:
                 state.refresh_queue.task_done()
 
 
-def _catalog_paths_from_env() -> tuple[Path, Path, Path | None]:
-    root = Path(__file__).resolve().parent
-    base = os.getenv("TMDB_CATALOG_BASE_ARTIFACT")
-    if not base:
-        pointer = load_active_model_pointer(state.state_dir)
-        base = pointer.get("artifact_dir") if pointer else None
-    if not base:
-        raise RuntimeError("TMDB_CATALOG_BASE_ARTIFACT or active model pointer is required")
-    output_root = Path(os.getenv("TRAIN_OUTPUT_ROOT", root / "artifacts/registry"))
-    links_raw = os.getenv("TMDB_LINKS_CSV")
-    links = Path(links_raw) if links_raw else None
-    return Path(base), output_root, links
-
-
-async def _execute_catalog_sync(*, download: bool = True) -> dict[str, Any]:
-    base_dir, output_root, links = _catalog_paths_from_env()
-    result = await asyncio.to_thread(
-        run_catalog_sync,
-        base_artifact_dir=base_dir,
-        output_root=output_root,
-        links_csv=links,
-        download=download,
-    )
-    catalog = state.load_catalog(str(result.snap_dir))
-    state.external_item_map = load_external_item_map(catalog.artifact_dir)
-    async with httpx.AsyncClient() as client:
-        recommender_payload = await client.post(
-            f"{RECOMMENDER_URL.rstrip('/')}/v1/admin/model/activate",
-            json={"artifact_dir": str(result.snap_dir), "reset_user_vectors": False},
-            timeout=120.0,
-        )
-        recommender_payload.raise_for_status()
-        rec_json = recommender_payload.json()
-    state.last_catalog_sync_at = utc_now_iso()
-    state.last_catalog_snap_dir = str(result.snap_dir)
-    return {
-        "snap_dir": str(result.snap_dir),
-        "n_items": result.n_items,
-        "model_version": catalog.model_version,
-        "recommender": rec_json,
-    }
-
-
-async def tmdb_catalog_sync_loop() -> None:
-    """Periodic TMDB daily-export → rebuild item catalog → activate on Recommender."""
-    interval = catalog_sync_interval_seconds()
-    run_on_start = os.getenv("TMDB_CATALOG_SYNC_ON_START", "1").lower() in ("1", "true", "yes")
-    if not run_on_start:
-        await asyncio.sleep(interval)
-
-    while not state.stop_event.is_set():
-        try:
-            async with state.lock:
-                if state.catalog_sync_running:
-                    log.info("tmdb catalog sync: skipped, previous run still marked busy")
-                else:
-                    state.catalog_sync_running = True
-            try:
-                payload = await _execute_catalog_sync(download=True)
-                log.info("tmdb catalog sync completed: %s", payload)
-            finally:
-                async with state.lock:
-                    state.catalog_sync_running = False
-        except Exception as exc:
-            log.warning("tmdb catalog sync failed: %s", exc)
-            async with state.lock:
-                state.catalog_sync_running = False
-        await asyncio.sleep(interval)
-
-
 async def retrain_threshold_loop() -> None:
     """Start full retrain when enough new DB interactions accumulated (Worker-side threshold)."""
     if RETRAIN_THRESHOLD <= 0:
@@ -641,13 +563,6 @@ async def startup() -> None:
     if RETRAIN_THRESHOLD > 0:
         state.background_tasks.append(asyncio.create_task(retrain_threshold_loop()))
         log.info("Retrain threshold enabled: %s interactions", RETRAIN_THRESHOLD)
-    if catalog_sync_enabled():
-        state.background_tasks.append(asyncio.create_task(tmdb_catalog_sync_loop()))
-        log.info(
-            "TMDB catalog sync enabled: every %.0f sec (%.1f days)",
-            catalog_sync_interval_seconds(),
-            catalog_sync_interval_seconds() / 86400.0,
-        )
 
     if PUSH_RECOMMENDER_ON_START:
         try:
@@ -685,11 +600,6 @@ async def health() -> dict[str, Any]:
         "retrain_threshold": RETRAIN_THRESHOLD,
         "retrain_check_interval_sec": RETRAIN_CHECK_INTERVAL,
         "retrain_running": state.retrain_running,
-        "tmdb_catalog_sync_enabled": catalog_sync_enabled(),
-        "tmdb_catalog_sync_interval_sec": catalog_sync_interval_seconds(),
-        "tmdb_catalog_sync_running": state.catalog_sync_running,
-        "last_catalog_sync_at": state.last_catalog_sync_at,
-        "last_catalog_snap_dir": state.last_catalog_snap_dir,
         "train_config_path": str(train_cfg.path),
         "train_hyperparameters": {
             "backend": train_cfg.backend,
@@ -739,64 +649,6 @@ async def get_user_vector(user_id: str) -> dict[str, Any]:
 async def recommender_resync() -> dict[str, Any]:
     async with httpx.AsyncClient() as client:
         return await push_all_vectors_to_recommender(client)
-
-
-@app.post("/v1/admin/catalog/sync")
-async def catalog_sync_now() -> dict[str, Any]:
-    """Download TMDB exports (if TMDB_API_KEY set), rebuild catalog snap, activate."""
-    async with state.lock:
-        if state.catalog_sync_running:
-            raise HTTPException(status_code=409, detail="Catalog sync already running")
-        state.catalog_sync_running = True
-    try:
-        return await _execute_catalog_sync(download=True)
-    finally:
-        async with state.lock:
-            state.catalog_sync_running = False
-
-
-@app.post("/v1/admin/catalog/sync-local")
-async def catalog_sync_local() -> dict[str, Any]:
-    """Rebuild catalog from files already in TMDB_EXPORT_DIR (no download)."""
-    async with state.lock:
-        if state.catalog_sync_running:
-            raise HTTPException(status_code=409, detail="Catalog sync already running")
-    export_dir = Path(os.getenv("TMDB_EXPORT_DIR", "train_data/tmdb/exports"))
-    movie_files = sorted(export_dir.glob("movie_ids_*.jsonl"), reverse=True)
-    tv_files = sorted(export_dir.glob("tv_series_ids_*.jsonl"), reverse=True)
-    if not movie_files or not tv_files:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Need movie_ids_*.jsonl and tv_series_ids_*.jsonl under {export_dir}",
-        )
-    base_dir, output_root, links = _catalog_paths_from_env()
-    result = await asyncio.to_thread(
-        run_catalog_sync,
-        base_artifact_dir=base_dir,
-        output_root=output_root,
-        links_csv=links,
-        movie_export=movie_files[0],
-        tv_export=tv_files[0],
-        download=False,
-    )
-    catalog = state.load_catalog(str(result.snap_dir))
-    state.external_item_map = load_external_item_map(catalog.artifact_dir)
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{RECOMMENDER_URL.rstrip('/')}/v1/admin/model/activate",
-            json={"artifact_dir": str(result.snap_dir), "reset_user_vectors": False},
-            timeout=120.0,
-        )
-        response.raise_for_status()
-        rec_json = response.json()
-    state.last_catalog_sync_at = utc_now_iso()
-    state.last_catalog_snap_dir = str(result.snap_dir)
-    return {
-        "snap_dir": str(result.snap_dir),
-        "n_items": result.n_items,
-        "model_version": catalog.model_version,
-        "recommender": rec_json,
-    }
 
 
 @app.post("/v1/admin/model/activate")
