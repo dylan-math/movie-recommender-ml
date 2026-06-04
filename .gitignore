@@ -1,0 +1,37 @@
+# --- Secrets & local config ---
+.env
+.env.*
+.env.example
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+.DS_Store
+
+# --- Docs & offline/dev (not prod runtime) ---
+architecture/
+offline/
+train_data/
+
+# --- Local bot stub (real bot is external) ---
+bot_backend_stub.py
+
+# --- Runtime & artifacts ---
+data/
+artifacts/
+offline/artifacts/
+
+*.log
+*.db
+*.sqlite

@@ -1,0 +1,40 @@
+# Worker + Recommender only. Point BOT_BACKEND_URL at your bot service (not in this repo).
+services:
+  worker:
+    build: .
+    command: uvicorn worker_service:app --host 0.0.0.0 --port 8002
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+      - ./train_data:/app/train_data:ro
+      - ./data:/app/data
+    environment:
+      RECOM_ARTIFACT_DIR: ${RECOM_ARTIFACT_DIR}
+      WORKER_STATE_DIR: /app/data/worker_state
+      BOT_BACKEND_URL: ${BOT_BACKEND_URL}
+      RECOMMENDER_URL: http://recommender:8001
+      BOT_POLL_INTERVAL_SECONDS: ${BOT_POLL_INTERVAL_SECONDS:-30}
+      RETRAIN_THRESHOLD: ${RETRAIN_THRESHOLD:-0}
+      RETRAIN_CHECK_INTERVAL_SECONDS: ${RETRAIN_CHECK_INTERVAL_SECONDS:-60}
+      WORKER_PUSH_RECOMMENDER_ON_START: "1"
+      TRAIN_INTERACTIONS_PATH: ${TRAIN_INTERACTIONS_PATH:-/app/train_data/movielens/interactions.parquet}
+      TRAIN_OUTPUT_ROOT: ${TRAIN_OUTPUT_ROOT:-/app/artifacts/registry}
+      TRAIN_CONFIG_PATH: ${TRAIN_CONFIG_PATH:-/app/train_config.yaml}
+      CUDA_PATH: /usr
+    depends_on:
+      - recommender
+
+  recommender:
+    build: .
+    command: uvicorn recommender_service:app --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+      - ./data:/app/data
+    environment:
+      RECOM_ARTIFACT_DIR: ${RECOM_ARTIFACT_DIR}
+      RECOM_STATE_DIR: /app/data/recommender_state
+      WORKER_URL: http://worker:8002
+      RECOM_SYNC_FROM_WORKER_ON_START: "1"

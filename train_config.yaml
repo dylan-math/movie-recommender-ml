@@ -1,0 +1,12 @@
+# Phase A ALS training (MovieLens). Hyperparameters: f64_i15.
+
+train_window:
+  mode: all
+  sliding_days: null
+
+als:
+  backend: cupy
+  use_gpu: true
+  factors: 64
+  regularization: 10.0
+  iterations: 15
