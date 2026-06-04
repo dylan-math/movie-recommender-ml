@@ -1,11 +1,8 @@
-# Worker + Recommender only. Point BOT_BACKEND_URL at your bot service (not in this repo).
+# Worker + Recommender. Worker reads ratings from plotwise Postgres (plotwise_default network).
 services:
   worker:
     build: .
     command: uvicorn worker_service:app --host 0.0.0.0 --port 8002
-    # Linux: reach services on the host (bot stub :9000) from inside the container
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     ports:
       - "8002:8002"
     volumes:
@@ -15,9 +12,9 @@ services:
     environment:
       RECOM_ARTIFACT_DIR: ${RECOM_ARTIFACT_DIR}
       WORKER_STATE_DIR: /app/data/worker_state
-      BOT_BACKEND_URL: ${BOT_BACKEND_URL}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://app_user:app_password@postgres:5432/app_db}
       RECOMMENDER_URL: http://recommender:8001
-      BOT_POLL_INTERVAL_SECONDS: ${BOT_POLL_INTERVAL_SECONDS:-30}
+      DB_POLL_INTERVAL_SECONDS: ${DB_POLL_INTERVAL_SECONDS:-30}
       RETRAIN_THRESHOLD: ${RETRAIN_THRESHOLD:-0}
       RETRAIN_CHECK_INTERVAL_SECONDS: ${RETRAIN_CHECK_INTERVAL_SECONDS:-60}
       WORKER_PUSH_RECOMMENDER_ON_START: "1"
@@ -25,6 +22,9 @@ services:
       TRAIN_OUTPUT_ROOT: ${TRAIN_OUTPUT_ROOT:-/app/artifacts/registry}
       TRAIN_CONFIG_PATH: ${TRAIN_CONFIG_PATH:-/app/train_config.yaml}
       CUDA_PATH: /usr
+    networks:
+      - default
+      - plotwise
     depends_on:
       - recommender
 
@@ -41,3 +41,8 @@ services:
       RECOM_STATE_DIR: /app/data/recommender_state
       WORKER_URL: http://worker:8002
       RECOM_SYNC_FROM_WORKER_ON_START: "1"
+
+networks:
+  plotwise:
+    external: true
+    name: plotwise_default

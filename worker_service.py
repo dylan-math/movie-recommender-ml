@@ -1,4 +1,7 @@
-"""Worker service: refresh queue + coalescing + user-vector push to recommender."""
+"""Worker service: refresh queue + coalescing + user-vector push to recommender.
+
+Reads user ratings from PostgreSQL (plotwise ``user_titles``). Pushes vectors to Recommender over HTTP.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +29,14 @@ from service_persistence import (
 )
 from train_config_loader import load_train_config_file, train_config_from_file
 from trainer_runner import TrainConfig, run_training_phase_a
+from worker_db import (
+    database_url,
+    fetch_interaction_count,
+    fetch_pending_users,
+    fetch_user_ratings,
+    load_external_item_map,
+    resolve_movie_id,
+)
 
 log = logging.getLogger("worker-service")
 
@@ -95,6 +106,10 @@ class WorkerState:
         self.stop_event = asyncio.Event()
         self.background_tasks: list[asyncio.Task[Any]] = []
         self.state_dir = Path(os.getenv("WORKER_STATE_DIR", "data/worker_state"))
+        self.external_item_map: dict[str, int] = {}
+        # In-memory only: no raw interactions persisted (vectors go to service_persistence).
+        self.poll_watermark: datetime | None = None
+        self.retrain_interaction_checkpoint: int = 0
 
     def load_bundle(self, artifact_dir: str | Path | None = None) -> ArtifactBundle:
         self.bundle = load_artifact_bundle(artifact_dir)
@@ -152,19 +167,11 @@ def env_float(name: str, default: float) -> float:
 
 COALESCE_SECONDS = env_float("WORKER_COALESCE_SECONDS", 15.0)
 REFRESH_WORKERS = max(1, int(env_float("WORKER_REFRESH_WORKERS", 2)))
-BOT_POLL_INTERVAL = env_float("BOT_POLL_INTERVAL_SECONDS", 30.0)
-BOT_BACKEND_URL = os.getenv("BOT_BACKEND_URL", "http://localhost:9000")
-BOT_RATINGS_PATH_TEMPLATE = os.getenv("BOT_RATINGS_PATH_TEMPLATE", "/v1/internal/users/{user_id}/ratings")
-BOT_PENDING_REFRESH_PATH = os.getenv("BOT_PENDING_REFRESH_PATH", "/v1/internal/users/pending_refresh")
-BOT_INTERACTION_STATS_PATH = os.getenv(
-    "BOT_INTERACTION_STATS_PATH", "/v1/internal/interactions/stats"
+DB_POLL_INTERVAL = env_float(
+    "DB_POLL_INTERVAL_SECONDS",
+    env_float("BOT_POLL_INTERVAL_SECONDS", 30.0),
 )
-BOT_RETRAIN_CHECKPOINT_PATH = os.getenv(
-    "BOT_RETRAIN_CHECKPOINT_PATH", "/v1/internal/retrain/checkpoint"
-)
-BOT_REFRESH_ACK_PATH_TEMPLATE = os.getenv(
-    "BOT_REFRESH_ACK_PATH_TEMPLATE", "/v1/internal/users/{user_id}/refresh_ack"
-)
+DB_POLL_LIMIT = max(1, int(env_float("DB_POLL_LIMIT", 200)))
 RETRAIN_THRESHOLD = int(env_float("RETRAIN_THRESHOLD", 0))
 RETRAIN_CHECK_INTERVAL = env_float("RETRAIN_CHECK_INTERVAL_SECONDS", 60.0)
 RECOMMENDER_URL = os.getenv("RECOMMENDER_URL", "http://localhost:8001")
@@ -177,50 +184,39 @@ PUSH_RECOMMENDER_ON_START = os.getenv("WORKER_PUSH_RECOMMENDER_ON_START", "1").l
     "yes",
 )
 
-
-async def fetch_bot_interaction_stats(client: httpx.AsyncClient) -> dict[str, int]:
-    response = await client.get(
-        f"{BOT_BACKEND_URL.rstrip('/')}{BOT_INTERACTION_STATS_PATH}",
-        timeout=10.0,
-    )
-    response.raise_for_status()
-    payload = response.json()
+async def fetch_interaction_stats() -> dict[str, int]:
+    total = await asyncio.to_thread(fetch_interaction_count)
+    async with state.lock:
+        checkpoint = state.retrain_interaction_checkpoint
     return {
-        "total_interactions": int(payload.get("total_interactions", 0)),
-        "new_since_checkpoint": int(payload.get("new_since_checkpoint", 0)),
+        "total_interactions": total,
+        "new_since_checkpoint": max(0, total - checkpoint),
     }
 
 
-async def acknowledge_bot_retrain_checkpoint(client: httpx.AsyncClient) -> None:
-    response = await client.post(f"{BOT_BACKEND_URL.rstrip('/')}{BOT_RETRAIN_CHECKPOINT_PATH}", timeout=10.0)
-    response.raise_for_status()
+async def acknowledge_retrain_checkpoint() -> None:
+    total = await asyncio.to_thread(fetch_interaction_count)
+    async with state.lock:
+        state.retrain_interaction_checkpoint = total
 
 
-async def fetch_user_ratings(client: httpx.AsyncClient, user_id: str) -> list[tuple[int, float]]:
-    path = BOT_RATINGS_PATH_TEMPLATE.format(user_id=user_id)
-    response = await client.get(f"{BOT_BACKEND_URL.rstrip('/')}{path}", timeout=10.0)
-    response.raise_for_status()
-    payload = response.json()
-    ratings = payload.get("ratings", payload if isinstance(payload, list) else [])
-    result: list[tuple[int, float]] = []
-    for row in ratings:
-        if not isinstance(row, dict):
-            continue
-        item_id = row.get("item_id") or row.get("movieId") or row.get("movie_id")
-        rating = row.get("rating")
-        if item_id is None or rating is None:
-            continue
-        result.append((int(item_id), float(rating)))
-    return result
-
-
-def project_known_items(bundle: ArtifactBundle, ratings: list[tuple[int, float]]) -> tuple[np.ndarray, np.ndarray]:
+def project_known_items(
+    bundle: ArtifactBundle,
+    ratings: list[tuple[str, float]],
+    *,
+    external_map: dict[str, int],
+) -> tuple[np.ndarray, np.ndarray]:
     item_indices: list[int] = []
     values: list[float] = []
     for item_id, rating in ratings:
-        idx = bundle.movie_id_to_idx.get(int(item_id))
-        if idx is None:
+        movie_id = resolve_movie_id(
+            item_id,
+            movie_id_to_idx=bundle.movie_id_to_idx,
+            external_map=external_map,
+        )
+        if movie_id is None:
             continue
+        idx = bundle.movie_id_to_idx[movie_id]
         item_indices.append(int(idx))
         values.append(float(rating))
     if not item_indices:
@@ -261,9 +257,14 @@ async def process_refresh_user(user_id: str, client: httpx.AsyncClient) -> None:
     if bundle is None:
         raise RuntimeError("Bundle is not loaded.")
 
-    ratings = await fetch_user_ratings(client, user_id)
-    item_indices, rating_values = project_known_items(bundle, ratings)
+    raw_ratings = await asyncio.to_thread(fetch_user_ratings, user_id)
+    item_indices, rating_values = project_known_items(
+        bundle,
+        raw_ratings,
+        external_map=state.external_item_map,
+    )
     if item_indices.size == 0:
+        log.debug("refresh skip user_id=%s: no ratings in model catalog", user_id)
         return
 
     vector = fit_user_vector(
@@ -283,12 +284,6 @@ async def process_refresh_user(user_id: str, client: httpx.AsyncClient) -> None:
         state.user_vectors[user_id] = record
     state.persist_user_vectors()
     await push_user_vector(client, user_id, record)
-
-    ack_path = BOT_REFRESH_ACK_PATH_TEMPLATE.format(user_id=user_id)
-    try:
-        await client.post(f"{BOT_BACKEND_URL.rstrip('/')}{ack_path}", timeout=5.0)
-    except Exception:
-        pass
 
 
 async def coalescer_loop() -> None:
@@ -324,48 +319,49 @@ async def refresh_worker_loop() -> None:
 
 
 async def retrain_threshold_loop() -> None:
-    """Start full retrain when enough new bot interactions accumulated (Worker-side threshold)."""
+    """Start full retrain when enough new DB interactions accumulated (Worker-side threshold)."""
     if RETRAIN_THRESHOLD <= 0:
         return
 
-    async with httpx.AsyncClient() as client:
-        while not state.stop_event.is_set():
-            try:
-                stats = await fetch_bot_interaction_stats(client)
-                new_count = stats["new_since_checkpoint"]
-                async with state.lock:
-                    busy = state.retrain_running
-                if not busy and new_count >= RETRAIN_THRESHOLD:
-                    log.info(
-                        "retrain threshold reached: new_interactions=%s threshold=%s",
-                        new_count,
-                        RETRAIN_THRESHOLD,
-                    )
-                    await start_retrain_job(
-                        RetrainRequest(reason="threshold", data_source="movie_lens"),
-                        mark_running=True,
-                    )
-            except Exception as exc:
-                log.debug("retrain threshold check: %s", exc)
-            await asyncio.sleep(RETRAIN_CHECK_INTERVAL)
-
-
-async def bot_poll_loop() -> None:
-    async with httpx.AsyncClient() as client:
-        while not state.stop_event.is_set():
-            try:
-                response = await client.get(
-                    f"{BOT_BACKEND_URL.rstrip('/')}{BOT_PENDING_REFRESH_PATH}",
-                    params={"limit": 200},
-                    timeout=10.0,
+    while not state.stop_event.is_set():
+        try:
+            stats = await fetch_interaction_stats()
+            new_count = stats["new_since_checkpoint"]
+            async with state.lock:
+                busy = state.retrain_running
+            if not busy and new_count >= RETRAIN_THRESHOLD:
+                log.info(
+                    "retrain threshold reached: new_interactions=%s threshold=%s",
+                    new_count,
+                    RETRAIN_THRESHOLD,
                 )
-                response.raise_for_status()
-                user_ids = response.json().get("user_ids", [])
-                for user_id in user_ids:
-                    await refresh(request=RefreshRequest(user_id=user_id))
-            except Exception as exc:
-                log.debug("bot poll: %s", exc)
-            await asyncio.sleep(BOT_POLL_INTERVAL)
+                await start_retrain_job(
+                    RetrainRequest(reason="threshold", data_source="movie_lens"),
+                    mark_running=True,
+                )
+        except Exception as exc:
+            log.debug("retrain threshold check: %s", exc)
+        await asyncio.sleep(RETRAIN_CHECK_INTERVAL)
+
+
+async def db_poll_loop() -> None:
+    """Poll DB for updated ratings; enqueue refresh. Watermark lives in RAM only."""
+    while not state.stop_event.is_set():
+        try:
+            async with state.lock:
+                since = state.poll_watermark
+            pending = await asyncio.to_thread(fetch_pending_users, since=since, limit=DB_POLL_LIMIT)
+            max_updated: datetime | None = since
+            for user_id, updated_at in pending:
+                await refresh(request=RefreshRequest(user_id=user_id))
+                if updated_at is not None and (max_updated is None or updated_at > max_updated):
+                    max_updated = updated_at
+            if max_updated is not None and max_updated != since:
+                async with state.lock:
+                    state.poll_watermark = max_updated
+        except Exception as exc:
+            log.warning("db poll: %s", exc)
+        await asyncio.sleep(DB_POLL_INTERVAL)
 
 
 def _bulk_load_user_vectors(bundle: ArtifactBundle) -> dict[str, UserVectorRecord]:
@@ -463,7 +459,7 @@ async def retrain_job(job_id: str, request: RetrainRequest) -> None:
 
         async with httpx.AsyncClient() as client:
             payload = await push_all_vectors_to_recommender(client)
-            await acknowledge_bot_retrain_checkpoint(client)
+            await acknowledge_retrain_checkpoint()
 
         status.status = "completed"
         status.model_version = bundle.model_version
@@ -487,7 +483,10 @@ async def startup() -> None:
     pointer = load_active_model_pointer(state.state_dir)
     if artifact_dir is None and pointer is not None:
         artifact_dir = pointer.get("artifact_dir")
-    state.load_bundle(artifact_dir)
+    bundle = state.load_bundle(artifact_dir)
+    state.external_item_map = load_external_item_map(bundle.artifact_dir)
+    if state.external_item_map:
+        log.info("Loaded %s external item_id mappings", len(state.external_item_map))
 
     restored = state.restore_user_vectors_from_disk()
     if restored == 0:
@@ -503,8 +502,8 @@ async def startup() -> None:
     state.background_tasks.append(asyncio.create_task(coalescer_loop()))
     for _ in range(REFRESH_WORKERS):
         state.background_tasks.append(asyncio.create_task(refresh_worker_loop()))
-    if BOT_POLL_INTERVAL > 0:
-        state.background_tasks.append(asyncio.create_task(bot_poll_loop()))
+    if DB_POLL_INTERVAL > 0:
+        state.background_tasks.append(asyncio.create_task(db_poll_loop()))
     if RETRAIN_THRESHOLD > 0:
         state.background_tasks.append(asyncio.create_task(retrain_threshold_loop()))
         log.info("Retrain threshold enabled: %s interactions", RETRAIN_THRESHOLD)
@@ -537,7 +536,8 @@ async def health() -> dict[str, Any]:
         "artifact_dir": None if bundle is None else str(bundle.artifact_dir),
         "queued_users": state.refresh_queue.qsize(),
         "known_user_vectors": len(state.user_vectors),
-        "bot_poll_interval_sec": BOT_POLL_INTERVAL,
+        "db_poll_interval_sec": DB_POLL_INTERVAL,
+        "database_url": database_url().replace("app_password", "***"),
         "retrain_threshold": RETRAIN_THRESHOLD,
         "retrain_check_interval_sec": RETRAIN_CHECK_INTERVAL,
         "retrain_running": state.retrain_running,
@@ -601,7 +601,7 @@ async def refresh(request: RefreshRequest) -> dict[str, Any]:
 
 @app.post("/v1/admin/retrain")
 async def retrain(request: RetrainRequest) -> dict[str, Any]:
-    """Manual or scheduled retrain (same job as threshold-triggered). Bot does not call this."""
+    """Manual or scheduled retrain (same job as threshold-triggered)."""
     async with state.lock:
         if state.retrain_running:
             raise HTTPException(status_code=409, detail="Retrain job already running")
