@@ -13,7 +13,9 @@ import numpy as np
 import pandas as pd
 
 from als_runtime import ArtifactBundle, load_artifact_bundle, resolve_item_index
-from utils import normalize_bot_item_id
+from utils import item_id_to_public_id, movie_id_to_public_map, normalize_bot_item_id
+from item_id_map_builder import ensure_item_id_map_for_snap
+from worker_db import load_external_item_map
 
 log = logging.getLogger("plotwise-catalog")
 
@@ -39,6 +41,7 @@ class PlotwiseItemCatalog:
     _overlay_ids: list[str]
     _overlay_factors: np.ndarray
     _data_dir: Path
+    _movie_id_to_public: dict[str, str]
 
     @property
     def artifact_dir(self) -> Path:
@@ -99,7 +102,15 @@ class PlotwiseItemCatalog:
                     base.model_version,
                 )
 
-        return cls._merge(base, overlay_ids, overlay_factors, data_dir=target)
+        ensure_item_id_map_for_snap(base.artifact_dir)
+        movie_id_to_public = movie_id_to_public_map(load_external_item_map(base.artifact_dir))
+        return cls._merge(
+            base,
+            overlay_ids,
+            overlay_factors,
+            data_dir=target,
+            movie_id_to_public=movie_id_to_public,
+        )
 
     @classmethod
     def _merge(
@@ -109,6 +120,7 @@ class PlotwiseItemCatalog:
         overlay_factors: np.ndarray,
         *,
         data_dir: Path,
+        movie_id_to_public: dict[str, str],
     ) -> PlotwiseItemCatalog:
         base_ids = [str(x) for x in np.asarray(base.movie_ids).reshape(-1)]
         base_idx = dict(base.item_id_to_idx)
@@ -144,6 +156,14 @@ class PlotwiseItemCatalog:
             _overlay_ids=clean_overlay_ids,
             _overlay_factors=overlay_stack,
             _data_dir=data_dir,
+            _movie_id_to_public=movie_id_to_public,
+        )
+
+    def public_item_id_at(self, idx: int) -> str | None:
+        """Row index → plotwise public token for API responses."""
+        return item_id_to_public_id(
+            str(self.item_ids[idx]),
+            movie_id_to_public=self._movie_id_to_public,
         )
 
     def cold_start_vector(self) -> np.ndarray:
@@ -230,7 +250,15 @@ class PlotwiseItemCatalog:
         overlay_factors = np.stack([cold] * len(overlay_ids)).astype(np.float32) if overlay_ids else np.zeros(
             (0, base.factors), dtype=np.float32
         )
-        merged = self._merge(base, overlay_ids, overlay_factors, data_dir=self._data_dir)
+        ensure_item_id_map_for_snap(base.artifact_dir)
+        movie_id_to_public = movie_id_to_public_map(load_external_item_map(base.artifact_dir))
+        merged = self._merge(
+            base,
+            overlay_ids,
+            overlay_factors,
+            data_dir=self._data_dir,
+            movie_id_to_public=movie_id_to_public,
+        )
         self.base = merged.base
         self.item_factors = merged.item_factors
         self.item_ids = merged.item_ids
@@ -238,6 +266,7 @@ class PlotwiseItemCatalog:
         self.item_id_format = merged.item_id_format
         self._overlay_ids = merged._overlay_ids
         self._overlay_factors = merged._overlay_factors
+        self._movie_id_to_public = merged._movie_id_to_public
 
     def persist(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)

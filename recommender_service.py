@@ -227,19 +227,20 @@ class RecommenderState:
             if seen_indices:
                 scores[seen_indices] = -np.inf
 
-            candidate_count = min(request.n, scores.shape[0])
-            if candidate_count <= 0:
-                return RecommendResponse(items=[])
-
-            top_idx = np.argpartition(-scores, candidate_count - 1)[:candidate_count]
-            top_idx = top_idx[np.argsort(-scores[top_idx])]
-            items = [
-                RecommendItem(
-                    item_id=str(catalog.item_ids[idx]),
-                    score=round(float(scores[idx]), 2),
+            ranked_idx = np.argsort(-scores)
+            items: list[RecommendItem] = []
+            for idx in ranked_idx:
+                if len(items) >= request.n:
+                    break
+                public_id = catalog.public_item_id_at(int(idx))
+                if public_id is None:
+                    continue
+                items.append(
+                    RecommendItem(
+                        item_id=public_id,
+                        score=round(float(scores[idx]), 2),
+                    )
                 )
-                for idx in top_idx
-            ]
             return RecommendResponse(items=items)
 
 

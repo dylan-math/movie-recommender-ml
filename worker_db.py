@@ -51,11 +51,13 @@ def connect() -> Iterator[Any]:
 
 def load_external_item_map(artifact_dir: Path | None) -> dict[str, int]:
     path_raw = os.getenv("ITEM_ID_MAP_PATH")
+    repo_root = Path(__file__).resolve().parent
     paths: list[Path] = []
     if path_raw:
         paths.append(Path(path_raw))
     if artifact_dir is not None:
         paths.append(artifact_dir / "item_id_map.csv")
+    paths.append(repo_root / "train_data/movielens/item_id_map.csv")
 
     mapping: dict[str, int] = {}
     for path in paths:

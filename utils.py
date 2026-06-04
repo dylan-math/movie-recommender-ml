@@ -50,3 +50,29 @@ def normalize_bot_item_id(raw: str) -> Optional[str]:
 	if value.startswith(f"{PREFIX}_"):
 		return _to_public_id(value)
 	return None
+
+
+def movie_id_to_public_map(forward: dict[str, int]) -> dict[str, str]:
+	"""Invert token→MovieLens map to movieId (str)→public token for recommend output."""
+	out: dict[str, str] = {}
+	for token, movie_id in forward.items():
+		public_id = normalize_bot_item_id(token)
+		if public_id is None:
+			continue
+		out[str(int(movie_id))] = public_id
+	return out
+
+
+def item_id_to_public_id(
+	raw: str,
+	*,
+	movie_id_to_public: dict[str, str] | None = None,
+) -> Optional[str]:
+	"""Catalog row id → plotwise public token (utils encoding), or None if unknown."""
+	public_id = normalize_bot_item_id(raw)
+	if public_id is not None:
+		return public_id
+	value = str(raw).strip()
+	if value.isdigit() and movie_id_to_public is not None:
+		return movie_id_to_public.get(value)
+	return None
