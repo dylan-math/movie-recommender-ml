@@ -85,50 +85,66 @@ def load_external_item_map(artifact_dir: Path | None) -> dict[str, int]:
     return mapping
 
 
-def fetch_user_ratings(user_id: str) -> list[tuple[str, float]]:
+def fetch_user_rating_snapshot(user_id: str) -> tuple[list[tuple[str, float]], datetime | None]:
     sql = os.getenv(
         "DB_RATINGS_SQL",
         """
-        SELECT item_id, rating FROM user_titles
+        SELECT item_id, rating, updated_at FROM user_titles
         WHERE user_id = :user_id AND rating IS NOT NULL
         ORDER BY updated_at
         """,
     ).strip()
     with connect() as conn:
         rows = conn.execute(text(sql), {"user_id": str(user_id)}).mappings().all()
-    return [
-        (str(row["item_id"]), float(row["rating"]))
-        for row in rows
-        if row.get("item_id") is not None and row.get("rating") is not None
-    ]
+    ratings: list[tuple[str, float]] = []
+    max_updated: datetime | None = None
+    for row in rows:
+        if row.get("item_id") is None or row.get("rating") is None:
+            continue
+        ratings.append((str(row["item_id"]), float(row["rating"])))
+        updated = row.get("updated_at")
+        if isinstance(updated, datetime) and (max_updated is None or updated > max_updated):
+            max_updated = updated
+    return ratings, max_updated
 
 
-def fetch_pending_users(*, since: datetime | None, limit: int) -> list[tuple[str, datetime | None]]:
+def fetch_user_ratings(user_id: str) -> list[tuple[str, float]]:
+    ratings, _ = fetch_user_rating_snapshot(user_id)
+    return ratings
+
+
+def fetch_users_with_new_ratings(
+    *,
+    last_refreshed_by_user: dict[str, datetime],
+    limit: int,
+) -> list[tuple[str, datetime | None]]:
+    """Users whose ``MAX(updated_at)`` is newer than their per-user watermark."""
     sql = os.getenv(
         "DB_PENDING_USERS_SQL",
         """
-        SELECT user_id, MAX(updated_at) AS max_updated FROM user_titles
-        WHERE rating IS NOT NULL AND (:since IS NULL OR updated_at > :since)
-        GROUP BY user_id ORDER BY max_updated LIMIT :limit
+        SELECT user_id::text AS user_id, MAX(updated_at) AS max_updated
+        FROM user_titles
+        WHERE rating IS NOT NULL
+        GROUP BY user_id
         """,
     ).strip()
     with connect() as conn:
-        rows = conn.execute(
-            text(sql),
-            {"since": since, "limit": max(1, min(limit, 10_000))},
-        ).mappings().all()
-    pending: list[tuple[str, datetime | None]] = []
+        rows = conn.execute(text(sql)).mappings().all()
+    pending: list[tuple[str, datetime]] = []
     for row in rows:
-        if row.get("user_id") is None:
+        user_id = row.get("user_id")
+        if user_id is None:
             continue
         updated = row.get("max_updated")
-        pending.append(
-            (
-                str(row["user_id"]),
-                updated if isinstance(updated, datetime) else None,
-            )
-        )
-    return pending
+        if not isinstance(updated, datetime):
+            continue
+        uid = str(user_id)
+        since = last_refreshed_by_user.get(uid)
+        if since is None or updated > since:
+            pending.append((uid, updated))
+    pending.sort(key=lambda item: item[1])
+    cap = max(1, min(limit, 10_000))
+    return pending[:cap]
 
 
 def fetch_interaction_count() -> int:

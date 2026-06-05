@@ -34,12 +34,26 @@ from trainer_runner import TrainConfig, run_training_phase_a
 from worker_db import (
     database_url_masked,
     fetch_interaction_count,
-    fetch_pending_users,
+    fetch_user_rating_snapshot,
     fetch_user_ratings,
+    fetch_users_with_new_ratings,
     load_external_item_map,
 )
 
 log = logging.getLogger("worker-service")
+
+
+def _configure_service_logging() -> None:
+    if log.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+
+_configure_service_logging()
 
 
 def utc_now_iso() -> str:
@@ -48,6 +62,10 @@ def utc_now_iso() -> str:
 
 class RefreshRequest(BaseModel):
     user_id: int | str
+
+
+class RefreshNowRequest(BaseModel):
+    recommender_updated_at: str | None = None
 
 
 class RetrainHyperparameters(BaseModel):
@@ -114,7 +132,8 @@ class WorkerState:
         self.state_dir = Path(os.getenv("WORKER_STATE_DIR", "data/worker_state"))
         self.external_item_map: dict[str, int] = {}
         # In-memory only: no raw interactions persisted (vectors go to service_persistence).
-        self.poll_watermark: datetime | None = None
+        self.poll_user_watermark: dict[str, datetime] = {}
+        self.pending_user_updated: dict[str, datetime] = {}
         self.retrain_interaction_checkpoint: int = 0
 
     def load_catalog(self, artifact_dir: str | Path | None = None) -> PlotwiseItemCatalog:
@@ -233,6 +252,29 @@ def project_known_items(
     return np.array(item_indices, dtype=np.int32), np.array(values, dtype=np.float32)
 
 
+async def post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    json: dict[str, Any],
+    timeout: float,
+    retries: int = 3,
+) -> httpx.Response:
+    last_exc: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            response = await client.post(url, json=json, timeout=timeout)
+            response.raise_for_status()
+            return response
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError) as exc:
+            last_exc = exc
+            if attempt + 1 < retries:
+                await asyncio.sleep(min(2**attempt, 5))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("post_with_retry failed without exception")
+
+
 async def push_user_vectors_batch(
     client: httpx.AsyncClient,
     *,
@@ -253,8 +295,12 @@ async def push_user_vectors_batch(
             for user_id, record in users
         ],
     }
-    response = await client.post(f"{RECOMMENDER_URL.rstrip('/')}/v1/internal/users/sync", json=payload, timeout=30.0)
-    response.raise_for_status()
+    await post_with_retry(
+        client,
+        f"{RECOMMENDER_URL.rstrip('/')}/v1/internal/users/sync",
+        json=payload,
+        timeout=30.0,
+    )
 
 
 async def push_user_vector(client: httpx.AsyncClient, user_id: str, record: UserVectorRecord) -> None:
@@ -280,28 +326,54 @@ async def push_plotwise_items_batch(
             for item_id, idx in items
         ],
     }
-    response = await client.post(
+    await post_with_retry(
+        client,
         f"{RECOMMENDER_URL.rstrip('/')}/v1/internal/items/append",
         json=payload,
         timeout=60.0,
     )
-    response.raise_for_status()
 
 
-async def process_refresh_user(user_id: str, client: httpx.AsyncClient) -> str:
-    """Compute user vector from DB ratings and push to Recommender.
+async def process_refresh_user(
+    user_id: str,
+    client: httpx.AsyncClient,
+    *,
+    recommender_updated_at: str | None = None,
+) -> str:
+    """Ensure user vector matches DB ratings and Recommender has the latest copy.
 
-    Returns ``ok``, ``no_ratings``, or ``no_usable_ratings``.
+    Returns ``ok`` (recomputed + pushed), ``pushed`` (reused worker vector),
+    ``unchanged`` (already in sync), ``no_ratings``, or ``no_usable_ratings``.
     """
     catalog = state.catalog
     if catalog is None:
         raise RuntimeError("Plotwise item catalog is not loaded.")
 
     user_id = str(user_id)
-    raw_ratings = await asyncio.to_thread(fetch_user_ratings, user_id)
+    raw_ratings, max_updated = await asyncio.to_thread(fetch_user_rating_snapshot, user_id)
     if not raw_ratings:
         log.debug("refresh skip user_id=%s: no ratings", user_id)
         return "no_ratings"
+
+    async with state.lock:
+        existing = state.user_vectors.get(user_id)
+        since = state.poll_user_watermark.get(user_id)
+        ratings_current = (
+            existing is not None
+            and max_updated is not None
+            and since is not None
+            and max_updated <= since
+        )
+
+    if ratings_current:
+        async with state.lock:
+            record = state.user_vectors[user_id]
+        if recommender_updated_at and recommender_updated_at == record.updated_at:
+            log.debug("refresh unchanged user_id=%s", user_id)
+            return "unchanged"
+        await push_user_vector(client, user_id, record)
+        log.info("refresh pushed existing vector user_id=%s", user_id)
+        return "pushed"
 
     async with state.lock:
         new_items = catalog.ensure_items(
@@ -342,6 +414,9 @@ async def process_refresh_user(user_id: str, client: httpx.AsyncClient) -> str:
     )
     async with state.lock:
         state.user_vectors[user_id] = record
+        if max_updated is not None:
+            state.poll_user_watermark[user_id] = max_updated
+            state.pending_user_updated.pop(user_id, None)
     state.persist_user_vectors()
     await push_user_vector(client, user_id, record)
     return "ok"
@@ -370,7 +445,14 @@ async def refresh_worker_loop() -> None:
             except asyncio.TimeoutError:
                 continue
             try:
-                await process_refresh_user(user_id, client)
+                result = await process_refresh_user(user_id, client)
+                if result == "ok":
+                    log.info("refresh ok user_id=%s pushed to recommender", user_id)
+                async with state.lock:
+                    if result in ("ok", "no_ratings", "no_usable_ratings"):
+                        ts = state.pending_user_updated.pop(user_id, None)
+                        if ts is not None:
+                            state.poll_user_watermark[user_id] = ts
             except Exception as exc:
                 log.warning("refresh failed user_id=%s: %s", user_id, exc)
             finally:
@@ -418,28 +500,25 @@ async def enqueue_refresh_user(user_id: str) -> bool:
 
 
 async def db_poll_loop() -> None:
-    """Poll DB every DB_POLL_INTERVAL for users with new ratings; refresh and push to Recommender.
-
-    Finds users via ``fetch_pending_users``: rows in ``user_titles`` where
-    ``MAX(updated_at) > poll_watermark`` (in-memory; first run uses all rated users).
-    """
+    """Poll DB every DB_POLL_INTERVAL for users with new ratings; refresh and push to Recommender."""
     while not state.stop_event.is_set():
         try:
             async with state.lock:
-                since = state.poll_watermark
-            pending = await asyncio.to_thread(fetch_pending_users, since=since, limit=DB_POLL_LIMIT)
-            max_updated: datetime | None = since
+                watermarks = dict(state.poll_user_watermark)
+            pending = await asyncio.to_thread(
+                fetch_users_with_new_ratings,
+                last_refreshed_by_user=watermarks,
+                limit=DB_POLL_LIMIT,
+            )
             queued = 0
             for user_id, updated_at in pending:
                 if await enqueue_refresh_user(user_id):
                     queued += 1
-                if updated_at is not None and (max_updated is None or updated_at > max_updated):
-                    max_updated = updated_at
-            if max_updated is not None and max_updated != since:
-                async with state.lock:
-                    state.poll_watermark = max_updated
+                    if updated_at is not None:
+                        async with state.lock:
+                            state.pending_user_updated[user_id] = updated_at
             if queued:
-                log.info("db poll: queued %s user(s) for refresh (watermark=%s)", queued, max_updated)
+                log.info("db poll: queued %s user(s) for refresh", queued)
         except Exception as exc:
             log.warning("db poll: %s", exc)
         await asyncio.sleep(DB_POLL_INTERVAL)
@@ -674,17 +753,26 @@ async def get_model() -> dict[str, Any]:
 
 
 @app.post("/v1/internal/users/{user_id}/refresh-now")
-async def refresh_user_now(user_id: str) -> dict[str, Any]:
-    """Synchronous ridge refresh + push to Recommender (for on-demand recommend)."""
+async def refresh_user_now(user_id: str, request: RefreshNowRequest | None = None) -> dict[str, Any]:
+    """Ensure vector is current for DB ratings and sync to Recommender (on-demand recommend)."""
+    body = request or RefreshNowRequest()
     async with httpx.AsyncClient() as client:
-        refresh_status = await process_refresh_user(str(user_id), client)
+        refresh_status = await process_refresh_user(
+            str(user_id),
+            client,
+            recommender_updated_at=body.recommender_updated_at,
+        )
     async with state.lock:
-        has_vector = str(user_id) in state.user_vectors
-    rating_count = len(await asyncio.to_thread(fetch_user_ratings, user_id))
+        record = state.user_vectors.get(str(user_id))
+        has_vector = record is not None
+        worker_updated_at = None if record is None else record.updated_at
+    ratings, _ = await asyncio.to_thread(fetch_user_rating_snapshot, user_id)
+    rating_count = len(ratings)
     return {
         "user_id": str(user_id),
         "refresh_status": refresh_status,
         "has_vector": has_vector,
+        "worker_updated_at": worker_updated_at,
         "rating_count": rating_count,
         "has_ratings": rating_count > 0,
     }

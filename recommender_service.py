@@ -406,8 +406,14 @@ WORKER_CONNECT_RETRIES = max(1, int(os.getenv("RECOM_WORKER_CONNECT_RETRIES", "1
 WORKER_CONNECT_RETRY_DELAY = float(os.getenv("RECOM_WORKER_CONNECT_RETRY_DELAY", "1.0"))
 
 
+def _recommender_vector_updated_at(user_id: str) -> str | None:
+    with state._lock:
+        record = state.user_vectors.get(user_id)
+        return None if record is None else record.updated_at
+
+
 async def ensure_user_vector_via_worker(user_id: str) -> bool:
-    """Ask Worker to refresh immediately and push vector into this Recommender.
+    """Ask Worker to ensure vector is current and sync into this Recommender.
 
     Returns True when the user vector is ready in this service; False otherwise
     (reason logged — caller should return an empty recommend list).
@@ -415,6 +421,7 @@ async def ensure_user_vector_via_worker(user_id: str) -> bool:
     base = WORKER_URL.rstrip("/")
     timeout = httpx.Timeout(WORKER_REQUEST_TIMEOUT)
     last_error: str | None = None
+    recommender_updated_at = _recommender_vector_updated_at(user_id)
 
     for attempt in range(1, WORKER_CONNECT_RETRIES + 1):
         try:
@@ -431,7 +438,10 @@ async def ensure_user_vector_via_worker(user_id: str) -> bool:
                     )
                     return False
 
-                refresh = await client.post(f"{base}/v1/internal/users/{user_id}/refresh-now")
+                refresh = await client.post(
+                    f"{base}/v1/internal/users/{user_id}/refresh-now",
+                    json={"recommender_updated_at": recommender_updated_at},
+                )
                 refresh.raise_for_status()
                 result = refresh.json()
         except httpx.HTTPStatusError as exc:
@@ -470,7 +480,7 @@ async def ensure_user_vector_via_worker(user_id: str) -> bool:
                 rating_count=int(result.get("rating_count") or 0),
             )
             return False
-        if refresh_status != "ok" or not result.get("has_vector"):
+        if refresh_status not in ("ok", "pushed", "unchanged") or not result.get("has_vector"):
             _log_empty_recommend(
                 user_id,
                 "no_usable_ratings",
@@ -479,7 +489,11 @@ async def ensure_user_vector_via_worker(user_id: str) -> bool:
                 refresh_status=refresh_status,
             )
             return False
-        log.info("Worker refresh-now completed for user_id=%s", user_id)
+        log.info(
+            "Worker refresh-now completed for user_id=%s status=%s",
+            user_id,
+            refresh_status,
+        )
         return True
 
     _log_empty_recommend(user_id, "worker_unavailable", last_error or "unknown")
@@ -490,20 +504,17 @@ async def ensure_user_vector_via_worker(user_id: str) -> bool:
 async def recommend(request: RecommendRequest, http_request: Request) -> RecommendResponse:
     user_id = str(request.user_id)
     http_request.state.recommend_user_id = user_id
+    if not await ensure_user_vector_via_worker(user_id):
+        return EMPTY_RECOMMEND_RESPONSE
     try:
         return state.recommend(request)
-    except UserNotReadyError as exc:
-        if not await ensure_user_vector_via_worker(exc.user_id):
-            return EMPTY_RECOMMEND_RESPONSE
-        try:
-            return state.recommend(request)
-        except UserNotReadyError:
-            _log_empty_recommend(
-                exc.user_id,
-                "vector_sync_failed",
-                "worker отработал, но вектор в recommender не появился",
-            )
-            return EMPTY_RECOMMEND_RESPONSE
+    except UserNotReadyError:
+        _log_empty_recommend(
+            user_id,
+            "vector_sync_failed",
+            "worker отработал, но вектор в recommender не появился",
+        )
+        return EMPTY_RECOMMEND_RESPONSE
     except RuntimeError as exc:
         _log_empty_recommend(user_id, "model_unavailable", str(exc))
         return EMPTY_RECOMMEND_RESPONSE
