@@ -426,11 +426,28 @@ async def process_refresh_user(
     )
     async with state.lock:
         state.user_vectors[user_id] = record
-        state.last_refreshed_fingerprint[user_id] = fingerprint
     state.persist_user_vectors()
     await push_user_vector(client, user_id, record)
+    async with state.lock:
+        state.last_refreshed_fingerprint[user_id] = fingerprint
     log.info("refresh recomputed user_id=%s fingerprint=%s", user_id, fingerprint[:8])
     return "ok"
+
+
+async def wait_for_recommender() -> None:
+    """Avoid startup race: worker poll must not push before recommender is listening."""
+    url = f"{RECOMMENDER_URL.rstrip('/')}/health"
+    for attempt in range(1, 61):
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=2.0)
+                if response.status_code == 200:
+                    log.info("Recommender reachable (attempt %s)", attempt)
+                    return
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError) as exc:
+            log.debug("Recommender wait attempt %s: %s", attempt, exc)
+        await asyncio.sleep(1.0)
+    log.warning("Recommender still unreachable after 60s; refresh pushes may fail until it is up")
 
 
 async def coalescer_loop() -> None:
@@ -507,6 +524,7 @@ async def enqueue_refresh_user(user_id: str) -> bool:
 
 async def db_poll_loop() -> None:
     """Poll DB every DB_POLL_INTERVAL for users with new ratings; refresh and push to Recommender."""
+    await wait_for_recommender()
     while not state.stop_event.is_set():
         try:
             async with state.lock:

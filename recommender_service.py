@@ -259,12 +259,14 @@ class RecommenderState:
 
             ranked_idx = np.argsort(-scores)
             items: list[RecommendItem] = []
+            seen_public_ids: set[str] = set()
             for idx in ranked_idx:
                 if len(items) >= request.n:
                     break
                 public_id = catalog.public_item_id_at(int(idx))
-                if public_id is None:
+                if public_id is None or public_id in seen_public_ids:
                     continue
+                seen_public_ids.add(public_id)
                 items.append(
                     RecommendItem(
                         item_id=public_id,
@@ -513,13 +515,22 @@ async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = Fals
                 user_id,
             )
             return await ensure_user_vector_via_worker(user_id, force_push=True)
-        if not _recommender_has_vector(user_id) and not force_push:
-            log.warning(
-                "Recommender missing vector after worker refresh user_id=%s status=%s; forcing push",
+        if not _recommender_has_vector(user_id):
+            if not force_push:
+                log.warning(
+                    "Recommender missing vector after worker refresh user_id=%s status=%s; forcing push",
+                    user_id,
+                    refresh_status,
+                )
+                return await ensure_user_vector_via_worker(user_id, force_push=True)
+            _log_empty_recommend(
                 user_id,
-                refresh_status,
+                "vector_sync_failed",
+                "worker ответил, но вектор в recommender не появился после push",
+                refresh_status=refresh_status,
+                worker_updated_at=worker_updated_at,
             )
-            return await ensure_user_vector_via_worker(user_id, force_push=True)
+            return False
         return True
 
     _log_empty_recommend(user_id, "worker_unavailable", last_error or "unknown")
