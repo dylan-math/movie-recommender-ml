@@ -77,7 +77,23 @@ def load_artifact_bundle(artifact_dir: str | Path | None = None) -> ArtifactBund
     target_dir = Path(artifact_dir or DEFAULT_ARTIFACT_DIR)
     config_path = target_dir / "config.json"
     if not config_path.exists():
-        raise FileNotFoundError(f"Missing config: {config_path}")
+        hint = ""
+        registry = target_dir.parent
+        if registry.is_dir():
+            snaps = sorted(
+                p.name for p in registry.iterdir() if p.is_dir() and (p / "config.json").exists()
+            )
+            if snaps:
+                hint = (
+                    f" Available snaps in {registry}: {', '.join(snaps)}."
+                    f" See {registry / 'active_model.json'} or RECOM_ARTIFACT_REGISTRY."
+                )
+            else:
+                hint = (
+                    f" No snaps under {registry}. artifacts/ is not in git — copy a trained bundle"
+                    " (config.json, item_factors.npy, movie_ids.npy, movie_metadata.csv, ...)."
+                )
+        raise FileNotFoundError(f"Missing config: {config_path}.{hint}")
 
     with open(config_path, encoding="utf-8") as file:
         config = json.load(file)

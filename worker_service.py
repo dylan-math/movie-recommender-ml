@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from als_runtime import ArtifactBundle, fit_user_vector, load_user_ids_npy, user_id_key
+from artifact_resolve import resolve_artifact_dir, save_registry_active_pointer
 from plotwise_catalog import PlotwiseItemCatalog, load_plotwise_catalog
 from service_persistence import (
     PersistedUserVector,
@@ -184,6 +185,11 @@ TRAIN_INTERACTIONS_PATH = os.getenv("TRAIN_INTERACTIONS_PATH")
 TRAIN_OUTPUT_ROOT = os.getenv("TRAIN_OUTPUT_ROOT")
 USER_VECTOR_SYNC_BATCH = max(1, int(env_float("USER_VECTOR_SYNC_BATCH", 256)))
 PUSH_RECOMMENDER_ON_START = os.getenv("WORKER_PUSH_RECOMMENDER_ON_START", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+WORKER_BOOTSTRAP_ON_START = os.getenv("WORKER_BOOTSTRAP_ON_START", "1").lower() in (
     "1",
     "true",
     "yes",
@@ -541,11 +547,19 @@ async def retrain_job(job_id: str, request: RetrainRequest) -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    artifact_dir = os.getenv("RECOM_ARTIFACT_DIR")
-    pointer = load_active_model_pointer(state.state_dir)
-    if artifact_dir is None and pointer is not None:
-        artifact_dir = pointer.get("artifact_dir")
-    catalog = state.load_catalog(artifact_dir)
+    artifact_path = await asyncio.to_thread(
+        resolve_artifact_dir,
+        env_dir=os.getenv("RECOM_ARTIFACT_DIR"),
+        allow_bootstrap=WORKER_BOOTSTRAP_ON_START,
+    )
+    catalog = state.load_catalog(str(artifact_path))
+    save_registry_active_pointer(
+        artifact_path.parent,
+        artifact_dir=catalog.artifact_dir,
+        model_version=catalog.model_version,
+    )
+    if WORKER_BOOTSTRAP_ON_START:
+        log.info("Artifact snap ready at %s (bootstrap_on_start=1)", artifact_path)
     state.external_item_map = load_external_item_map(catalog.artifact_dir)
     if state.external_item_map:
         log.info("Loaded %s external item_id mappings", len(state.external_item_map))

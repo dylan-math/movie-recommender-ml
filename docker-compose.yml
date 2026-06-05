@@ -1,7 +1,10 @@
 # Worker + Recommender. Worker reads ratings from plotwise Postgres (plotwise_default network).
+# Requires: copy .env.example → .env, set DATABASE_URL + RECOM_ARTIFACT_DIR (container path).
+# artifacts/ is gitignored — share a trained snap bundle separately (rsync/scp).
 services:
   worker:
     build: .
+    env_file: .env
     command: uvicorn worker_service:app --host 0.0.0.0 --port 8002
     healthcheck:
       test:
@@ -14,7 +17,7 @@ services:
       interval: 5s
       timeout: 10s
       retries: 30
-      start_period: 120s
+      start_period: 900s
     ports:
       - "8002:8002"
     volumes:
@@ -22,8 +25,11 @@ services:
       - ./train_data:/app/train_data:ro
       - ./data:/app/data
     environment:
-      # Container path (host ./artifacts mounted at /app/artifacts)
-      RECOM_ARTIFACT_DIR: /app/artifacts/registry/snap-phase-a-20260602T225455Z
+      # Registry root (always created). Active snap: artifacts/registry/active_model.json
+      RECOM_ARTIFACT_REGISTRY: ${RECOM_ARTIFACT_REGISTRY:-/app/artifacts/registry}
+      TRAIN_OUTPUT_ROOT: ${TRAIN_OUTPUT_ROOT:-/app/artifacts/registry}
+      # Optional pin to a specific snap subdir (leave unset in .env for pointer-based resolve)
+      RECOM_ARTIFACT_DIR: ${RECOM_ARTIFACT_DIR:-}
       WORKER_STATE_DIR: /app/data/worker_state
       DATABASE_URL: ${DATABASE_URL}
       RECOMMENDER_URL: http://recommender:8001
@@ -32,8 +38,8 @@ services:
       RETRAIN_CHECK_INTERVAL_SECONDS: ${RETRAIN_CHECK_INTERVAL_SECONDS:-60}
       # Recommender restores vectors from ./data; skip 12k-user bulk push on every container start
       WORKER_PUSH_RECOMMENDER_ON_START: "0"
+      WORKER_BOOTSTRAP_ON_START: ${WORKER_BOOTSTRAP_ON_START:-1}
       TRAIN_INTERACTIONS_PATH: ${TRAIN_INTERACTIONS_PATH:-/app/train_data/movielens/interactions.parquet}
-      TRAIN_OUTPUT_ROOT: ${TRAIN_OUTPUT_ROOT:-/app/artifacts/registry}
       TRAIN_CONFIG_PATH: ${TRAIN_CONFIG_PATH:-/app/train_config.yaml}
       CUDA_PATH: /usr
       PLOTWISE_ITEM_DATA_DIR: /app/data/plotwise_item_data
@@ -43,6 +49,7 @@ services:
 
   recommender:
     build: .
+    env_file: .env
     command: uvicorn recommender_service:app --host 0.0.0.0 --port 8001
     ports:
       - "8001:8001"
@@ -50,7 +57,9 @@ services:
       - ./artifacts:/app/artifacts:ro
       - ./data:/app/data
     environment:
-      RECOM_ARTIFACT_DIR: /app/artifacts/registry/snap-phase-a-20260602T225455Z
+      RECOM_ARTIFACT_REGISTRY: ${RECOM_ARTIFACT_REGISTRY:-/app/artifacts/registry}
+      TRAIN_OUTPUT_ROOT: ${TRAIN_OUTPUT_ROOT:-/app/artifacts/registry}
+      RECOM_ARTIFACT_DIR: ${RECOM_ARTIFACT_DIR:-}
       RECOM_STATE_DIR: /app/data/recommender_state
       WORKER_URL: http://worker:8002
       RECOM_SYNC_FROM_WORKER_ON_START: "0"

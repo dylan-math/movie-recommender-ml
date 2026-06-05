@@ -19,6 +19,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
+from artifact_resolve import resolve_artifact_dir
 from plotwise_catalog import PlotwiseItemCatalog, load_plotwise_catalog
 from service_persistence import (
     PersistedUserVector,
@@ -347,11 +348,12 @@ async def sync_from_worker() -> dict[str, Any]:
 
 @app.on_event("startup")
 async def startup() -> None:
-    artifact_dir = os.getenv("RECOM_ARTIFACT_DIR")
-    pointer = load_active_model_pointer(state.state_dir)
-    if artifact_dir is None and pointer is not None:
-        artifact_dir = pointer.get("artifact_dir")
-    catalog = state.load_catalog(artifact_dir, reset_vectors=False)
+    artifact_path = await asyncio.to_thread(
+        resolve_artifact_dir,
+        env_dir=os.getenv("RECOM_ARTIFACT_DIR"),
+        allow_bootstrap=False,
+    )
+    catalog = state.load_catalog(str(artifact_path), reset_vectors=False)
     log.info(
         "Plotwise item data: %s base items, %s overlay items",
         catalog.base.item_factors.shape[0],

@@ -243,6 +243,7 @@ def run_training_phase_a(
     interactions_path: Path | None = None,
     artifact_dir: Path | None = None,
     output_root: Path | None = None,
+    output_dir: Path | None = None,
     config: TrainConfig | None = None,
     movies_csv: Path | None = None,
 ) -> TrainRunResult:
@@ -254,9 +255,13 @@ def run_training_phase_a(
 
     result = _run_training(interactions=interactions, config=cfg)
 
-    model_version = f"snap-phase-a-{pd.Timestamp.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
     out_root = output_root or DEFAULT_OUTPUT_ROOT
-    out_dir = out_root / model_version
+    if output_dir is not None:
+        out_dir = Path(output_dir)
+        model_version = out_dir.name
+    else:
+        model_version = f"snap-phase-a-{pd.Timestamp.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+        out_dir = out_root / model_version
     save_bundle(
         output_dir=out_dir,
         train_result=result,
