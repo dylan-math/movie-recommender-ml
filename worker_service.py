@@ -282,12 +282,21 @@ async def push_plotwise_items_batch(
     response.raise_for_status()
 
 
-async def process_refresh_user(user_id: str, client: httpx.AsyncClient) -> None:
+async def process_refresh_user(user_id: str, client: httpx.AsyncClient) -> str:
+    """Compute user vector from DB ratings and push to Recommender.
+
+    Returns ``ok``, ``no_ratings``, or ``no_usable_ratings``.
+    """
     catalog = state.catalog
     if catalog is None:
         raise RuntimeError("Plotwise item catalog is not loaded.")
 
+    user_id = str(user_id)
     raw_ratings = await asyncio.to_thread(fetch_user_ratings, user_id)
+    if not raw_ratings:
+        log.debug("refresh skip user_id=%s: no ratings", user_id)
+        return "no_ratings"
+
     async with state.lock:
         new_items = catalog.ensure_items(
             (item_id for item_id, _ in raw_ratings),
@@ -310,7 +319,7 @@ async def process_refresh_user(user_id: str, client: httpx.AsyncClient) -> None:
     )
     if item_indices.size == 0:
         log.debug("refresh skip user_id=%s: no usable ratings", user_id)
-        return
+        return "no_usable_ratings"
 
     vector = fit_user_vector(
         item_factors=catalog.item_factors,
@@ -329,6 +338,7 @@ async def process_refresh_user(user_id: str, client: httpx.AsyncClient) -> None:
         state.user_vectors[user_id] = record
     state.persist_user_vectors()
     await push_user_vector(client, user_id, record)
+    return "ok"
 
 
 async def coalescer_loop() -> None:
@@ -626,6 +636,38 @@ async def get_model() -> dict[str, Any]:
         "n_items": int(catalog.item_factors.shape[0]),
         "plotwise_overlay_items": catalog.overlay_count,
         "known_user_vectors": len(state.user_vectors),
+    }
+
+
+@app.post("/v1/internal/users/{user_id}/refresh-now")
+async def refresh_user_now(user_id: str) -> dict[str, Any]:
+    """Synchronous ridge refresh + push to Recommender (for on-demand recommend)."""
+    async with httpx.AsyncClient() as client:
+        refresh_status = await process_refresh_user(str(user_id), client)
+    async with state.lock:
+        has_vector = str(user_id) in state.user_vectors
+    rating_count = len(await asyncio.to_thread(fetch_user_ratings, user_id))
+    return {
+        "user_id": str(user_id),
+        "refresh_status": refresh_status,
+        "has_vector": has_vector,
+        "rating_count": rating_count,
+        "has_ratings": rating_count > 0,
+    }
+
+
+@app.get("/v1/internal/users/{user_id}/recommend-readiness")
+async def recommend_readiness(user_id: str) -> dict[str, Any]:
+    """Whether the user has DB ratings and a computed vector (for Recommender error messages)."""
+    ratings = await asyncio.to_thread(fetch_user_ratings, user_id)
+    async with state.lock:
+        has_vector = str(user_id) in state.user_vectors
+    rating_count = len(ratings)
+    return {
+        "user_id": str(user_id),
+        "rating_count": rating_count,
+        "has_ratings": rating_count > 0,
+        "has_vector": has_vector,
     }
 
 

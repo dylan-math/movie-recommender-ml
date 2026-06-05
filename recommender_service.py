@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import logging
 import os
 from dataclasses import dataclass
@@ -12,7 +14,12 @@ from typing import Any
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
 from plotwise_catalog import PlotwiseItemCatalog, load_plotwise_catalog
@@ -26,6 +33,31 @@ from service_persistence import (
 )
 
 log = logging.getLogger("recommender-service")
+
+
+def _configure_service_logging() -> None:
+    """Ensure app logs appear in docker compose logs (uvicorn does not configure this logger)."""
+    if log.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+
+_configure_service_logging()
+
+_current_http_request: contextvars.ContextVar[Request | None] = contextvars.ContextVar(
+    "current_http_request",
+    default=None,
+)
+
+
+class UserNotReadyError(Exception):
+    def __init__(self, user_id: str) -> None:
+        self.user_id = user_id
+        super().__init__(user_id)
 
 
 def utc_now_iso() -> str:
@@ -215,7 +247,7 @@ class RecommenderState:
                 raise RuntimeError("Plotwise item catalog is not loaded.")
             record = self.user_vectors.get(str(request.user_id))
             if record is None:
-                raise KeyError(f"Missing user vector for user_id={request.user_id}")
+                raise UserNotReadyError(str(request.user_id))
 
             scores = catalog.global_mean + catalog.item_factors @ record.vector
             scores = scores.copy()
@@ -246,6 +278,97 @@ class RecommenderState:
 
 app = FastAPI(title="recommender-service")
 state = RecommenderState()
+
+
+def _user_id_from_validation(exc: RequestValidationError) -> str:
+    body = exc.body
+    if isinstance(body, dict) and body.get("user_id") is not None:
+        return str(body["user_id"])
+    if isinstance(body, bytes):
+        try:
+            import json
+
+            parsed = json.loads(body)
+            if isinstance(parsed, dict) and parsed.get("user_id") is not None:
+                return str(parsed["user_id"])
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+    return "?"
+
+
+def _log_recommend_422(user_id: str, code: str, message: str) -> None:
+    """Log every 422 on POST /v1/recommend (INFO so it always appears next to access logs)."""
+    http_request = _current_http_request.get()
+    if http_request is not None:
+        http_request.state.recommend_422_logged = True
+        http_request.state.recommend_user_id = user_id
+    log.info(
+        "POST /v1/recommend: user_id=%s — %s [422 code=%s]",
+        user_id,
+        message,
+        code,
+    )
+
+
+@app.middleware("http")
+async def bind_http_request(request: Request, call_next):
+    token = _current_http_request.set(request)
+    try:
+        response = await call_next(request)
+    finally:
+        _current_http_request.reset(token)
+
+    if (
+        request.method == "POST"
+        and request.url.path.rstrip("/") == "/v1/recommend"
+        and response.status_code == 422
+        and not getattr(request.state, "recommend_422_logged", False)
+    ):
+        user_id = getattr(request.state, "recommend_user_id", "?")
+        _log_recommend_422(
+            user_id,
+            "unknown",
+            "ответ 422 без явной причины в коде (см. тело ответа клиента)",
+        )
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    if request.url.path.rstrip("/") == "/v1/recommend":
+        _log_recommend_422(
+            _user_id_from_validation(exc),
+            "validation_error",
+            f"невалидный запрос (не «нет оценок»): {exc.errors()}",
+        )
+    return await request_validation_exception_handler(request, exc)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler_logged(request: Request, exc: HTTPException):
+    if request.url.path.rstrip("/") == "/v1/recommend" and exc.status_code == 422:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"message": exc.detail}
+        code = str(detail.get("code") or "unknown")
+        user_id = str(
+            detail.get("user_id")
+            or getattr(request.state, "recommend_user_id", None)
+            or "?"
+        )
+        if not getattr(request.state, "recommend_422_logged", False):
+            if code == "no_ratings":
+                rating_count = detail.get("rating_count", 0)
+                _log_recommend_422(
+                    user_id,
+                    code,
+                    f"нет оценок (rating_count={rating_count})",
+                )
+            else:
+                _log_recommend_422(
+                    user_id,
+                    code,
+                    str(detail.get("message") or detail),
+                )
+    return await http_exception_handler(request, exc)
 
 WORKER_URL = os.getenv("WORKER_URL", "http://localhost:8002")
 SYNC_FROM_WORKER_ON_START = os.getenv("RECOM_SYNC_FROM_WORKER_ON_START", "1").lower() in (
@@ -319,12 +442,126 @@ def get_model() -> dict[str, Any]:
     }
 
 
+WORKER_REQUEST_TIMEOUT = float(os.getenv("RECOM_WORKER_REQUEST_TIMEOUT", "60"))
+WORKER_CONNECT_RETRIES = max(1, int(os.getenv("RECOM_WORKER_CONNECT_RETRIES", "15")))
+WORKER_CONNECT_RETRY_DELAY = float(os.getenv("RECOM_WORKER_CONNECT_RETRY_DELAY", "1.0"))
+
+
+def _no_ratings_exception(user_id: str, rating_count: int = 0) -> HTTPException:
+    _log_recommend_422(
+        user_id,
+        "no_ratings",
+        f"нет оценок (rating_count={rating_count})",
+    )
+    return HTTPException(
+        status_code=422,
+        detail={
+            "code": "no_ratings",
+            "message": "User has no ratings. At least one rated title is required for recommendations.",
+            "user_message": "This user has no ratings yet.",
+            "user_id": user_id,
+            "rating_count": rating_count,
+        },
+    )
+
+
+def _worker_unavailable_exception(user_id: str, reason: str) -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "code": "worker_unavailable",
+            "message": "Worker service is not reachable; retry recommend shortly.",
+            "user_id": user_id,
+            "reason": reason,
+        },
+    )
+
+
+async def ensure_user_vector_via_worker(user_id: str) -> None:
+    """Ask Worker to refresh immediately and push vector into this Recommender."""
+    base = WORKER_URL.rstrip("/")
+    timeout = httpx.Timeout(WORKER_REQUEST_TIMEOUT)
+    last_error: str | None = None
+
+    for attempt in range(1, WORKER_CONNECT_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                readiness = await client.get(f"{base}/v1/internal/users/{user_id}/recommend-readiness")
+                readiness.raise_for_status()
+                snapshot = readiness.json()
+                if not snapshot.get("has_ratings"):
+                    raise _no_ratings_exception(user_id, int(snapshot.get("rating_count") or 0))
+
+                refresh = await client.post(f"{base}/v1/internal/users/{user_id}/refresh-now")
+                refresh.raise_for_status()
+                result = refresh.json()
+        except HTTPException:
+            raise
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(
+                status_code=exc.response.status_code,
+                detail={
+                    "code": "worker_error",
+                    "message": f"Worker returned HTTP {exc.response.status_code}",
+                    "user_id": user_id,
+                },
+            ) from exc
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last_error = str(exc)
+            log.warning(
+                "Worker unreachable attempt %s/%s user_id=%s: %s",
+                attempt,
+                WORKER_CONNECT_RETRIES,
+                user_id,
+                exc,
+            )
+            if attempt < WORKER_CONNECT_RETRIES:
+                await asyncio.sleep(WORKER_CONNECT_RETRY_DELAY)
+                continue
+            raise _worker_unavailable_exception(user_id, last_error) from exc
+        except httpx.TimeoutException as exc:
+            last_error = str(exc)
+            log.warning("Worker timeout user_id=%s: %s", user_id, exc)
+            raise _worker_unavailable_exception(user_id, last_error) from exc
+
+        refresh_status = str(result.get("refresh_status") or "")
+        if refresh_status == "no_ratings":
+            raise _no_ratings_exception(user_id, int(result.get("rating_count") or 0))
+        if refresh_status != "ok" or not result.get("has_vector"):
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "no_usable_ratings",
+                    "message": "User has ratings but none map to the catalog; cannot build a profile vector.",
+                    "user_id": user_id,
+                    "rating_count": int(result.get("rating_count") or 0),
+                    "refresh_status": refresh_status,
+                },
+            )
+        log.info("Worker refresh-now completed for user_id=%s", user_id)
+        return
+
+    raise _worker_unavailable_exception(user_id, last_error or "unknown")
+
+
 @app.post("/v1/recommend", response_model=RecommendResponse)
-def recommend(request: RecommendRequest) -> RecommendResponse:
+async def recommend(request: RecommendRequest, http_request: Request) -> RecommendResponse:
+    http_request.state.recommend_user_id = str(request.user_id)
     try:
         return state.recommend(request)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UserNotReadyError as exc:
+        await ensure_user_vector_via_worker(exc.user_id)
+        try:
+            return state.recommend(request)
+        except UserNotReadyError as retry_exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "vector_sync_failed",
+                    "message": "Worker refreshed the user but Recommender still has no vector.",
+                    "user_id": retry_exc.user_id,
+                },
+            ) from retry_exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
