@@ -412,7 +412,12 @@ def _recommender_vector_updated_at(user_id: str) -> str | None:
         return None if record is None else record.updated_at
 
 
-async def ensure_user_vector_via_worker(user_id: str) -> bool:
+def _recommender_has_vector(user_id: str) -> bool:
+    with state._lock:
+        return user_id in state.user_vectors
+
+
+async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = False) -> bool:
     """Ask Worker to ensure vector is current and sync into this Recommender.
 
     Returns True when the user vector is ready in this service; False otherwise
@@ -421,7 +426,7 @@ async def ensure_user_vector_via_worker(user_id: str) -> bool:
     base = WORKER_URL.rstrip("/")
     timeout = httpx.Timeout(WORKER_REQUEST_TIMEOUT)
     last_error: str | None = None
-    recommender_updated_at = _recommender_vector_updated_at(user_id)
+    recommender_updated_at = None if force_push else _recommender_vector_updated_at(user_id)
 
     for attempt in range(1, WORKER_CONNECT_RETRIES + 1):
         try:
@@ -489,11 +494,32 @@ async def ensure_user_vector_via_worker(user_id: str) -> bool:
                 refresh_status=refresh_status,
             )
             return False
+        worker_updated_at = result.get("worker_updated_at")
+        local_updated_at = _recommender_vector_updated_at(user_id)
         log.info(
-            "Worker refresh-now completed for user_id=%s status=%s",
+            "Worker refresh-now completed for user_id=%s status=%s worker_updated_at=%s local_updated_at=%s",
             user_id,
             refresh_status,
+            worker_updated_at,
+            local_updated_at,
         )
+        if (
+            not force_push
+            and worker_updated_at
+            and local_updated_at != worker_updated_at
+        ):
+            log.warning(
+                "Recommender vector version lags worker user_id=%s; forcing push",
+                user_id,
+            )
+            return await ensure_user_vector_via_worker(user_id, force_push=True)
+        if not _recommender_has_vector(user_id) and not force_push:
+            log.warning(
+                "Recommender missing vector after worker refresh user_id=%s status=%s; forcing push",
+                user_id,
+                refresh_status,
+            )
+            return await ensure_user_vector_via_worker(user_id, force_push=True)
         return True
 
     _log_empty_recommend(user_id, "worker_unavailable", last_error or "unknown")
@@ -507,8 +533,21 @@ async def recommend(request: RecommendRequest, http_request: Request) -> Recomme
     if not await ensure_user_vector_via_worker(user_id):
         return EMPTY_RECOMMEND_RESPONSE
     try:
-        return state.recommend(request)
+        response = state.recommend(request)
+        if not response.items and _recommender_has_vector(user_id):
+            log.warning(
+                "POST /v1/recommend: zero scored items user_id=%s n=%s seen=%s",
+                user_id,
+                request.n,
+                len(request.seen_item_ids),
+            )
+        return response
     except UserNotReadyError:
+        if await ensure_user_vector_via_worker(user_id, force_push=True):
+            try:
+                return state.recommend(request)
+            except UserNotReadyError:
+                pass
         _log_empty_recommend(
             user_id,
             "vector_sync_failed",

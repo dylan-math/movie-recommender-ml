@@ -294,12 +294,20 @@ async def push_user_vectors_batch(
             for user_id, record in users
         ],
     }
-    await post_with_retry(
+    response = await post_with_retry(
         client,
         f"{RECOMMENDER_URL.rstrip('/')}/v1/internal/users/sync",
         json=payload,
         timeout=30.0,
     )
+    sync_result = response.json()
+    applied = int(sync_result.get("applied") or 0)
+    rejected = int(sync_result.get("rejected") or 0)
+    if len(users) == 1 and applied == 0:
+        user_id = users[0][0]
+        raise RuntimeError(
+            f"users/sync applied=0 rejected={rejected} user_id={user_id} response={sync_result}"
+        )
 
 
 async def push_user_vector(client: httpx.AsyncClient, user_id: str, record: UserVectorRecord) -> None:
@@ -341,8 +349,13 @@ async def process_refresh_user(
 ) -> str:
     """Ensure user vector matches DB ratings and Recommender has the latest copy.
 
-    Returns ``ok`` (recomputed + pushed), ``pushed`` (reused worker vector),
-    ``unchanged`` (already in sync), ``no_ratings``, or ``no_usable_ratings``.
+    Recomputes when ratings fingerprint changed (always pushes). Reuses the
+    stored worker vector only when fingerprint is current; pushes to Recommender
+    whenever its ``updated_at`` lags behind the worker copy.
+
+    Returns ``ok`` (recomputed + pushed), ``pushed`` (synced existing vector),
+    ``unchanged`` (recommender already has this ``updated_at``), ``no_ratings``,
+    or ``no_usable_ratings``.
     """
     catalog = state.catalog
     if catalog is None:
@@ -366,7 +379,12 @@ async def process_refresh_user(
             log.debug("refresh unchanged user_id=%s fingerprint=%s", user_id, fingerprint[:8])
             return "unchanged"
         await push_user_vector(client, user_id, record)
-        log.info("refresh pushed existing vector user_id=%s", user_id)
+        log.info(
+            "refresh pushed existing vector user_id=%s worker_updated_at=%s recommender_updated_at=%s",
+            user_id,
+            record.updated_at,
+            recommender_updated_at,
+        )
         return "pushed"
 
     async with state.lock:
@@ -751,7 +769,7 @@ async def refresh_user_now(user_id: str, request: RefreshNowRequest | None = Non
         record = state.user_vectors.get(str(user_id))
         has_vector = record is not None
         worker_updated_at = None if record is None else record.updated_at
-    ratings, _ = await asyncio.to_thread(fetch_user_rating_snapshot, user_id)
+    ratings, _, _ = await asyncio.to_thread(fetch_user_rating_snapshot, user_id)
     rating_count = len(ratings)
     return {
         "user_id": str(user_id),
