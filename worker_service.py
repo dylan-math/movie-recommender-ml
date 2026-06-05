@@ -405,21 +405,41 @@ async def retrain_threshold_loop() -> None:
         await asyncio.sleep(RETRAIN_CHECK_INTERVAL)
 
 
+async def enqueue_refresh_user(user_id: str) -> bool:
+    """Queue immediate ridge refresh + push to Recommender (skips HTTP refresh coalesce)."""
+    user_id = str(user_id)
+    async with state.lock:
+        if user_id in state.enqueued:
+            return False
+        state.enqueued.add(user_id)
+        state.pending_deadline.pop(user_id, None)
+    await state.refresh_queue.put(user_id)
+    return True
+
+
 async def db_poll_loop() -> None:
-    """Poll DB for updated ratings; enqueue refresh. Watermark lives in RAM only."""
+    """Poll DB every DB_POLL_INTERVAL for users with new ratings; refresh and push to Recommender.
+
+    Finds users via ``fetch_pending_users``: rows in ``user_titles`` where
+    ``MAX(updated_at) > poll_watermark`` (in-memory; first run uses all rated users).
+    """
     while not state.stop_event.is_set():
         try:
             async with state.lock:
                 since = state.poll_watermark
             pending = await asyncio.to_thread(fetch_pending_users, since=since, limit=DB_POLL_LIMIT)
             max_updated: datetime | None = since
+            queued = 0
             for user_id, updated_at in pending:
-                await refresh(request=RefreshRequest(user_id=user_id))
+                if await enqueue_refresh_user(user_id):
+                    queued += 1
                 if updated_at is not None and (max_updated is None or updated_at > max_updated):
                     max_updated = updated_at
             if max_updated is not None and max_updated != since:
                 async with state.lock:
                     state.poll_watermark = max_updated
+            if queued:
+                log.info("db poll: queued %s user(s) for refresh (watermark=%s)", queued, max_updated)
         except Exception as exc:
             log.warning("db poll: %s", exc)
         await asyncio.sleep(DB_POLL_INTERVAL)

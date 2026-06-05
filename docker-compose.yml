@@ -21,7 +21,8 @@ services:
     ports:
       - "8002:8002"
     volumes:
-      - ./artifacts:/app/artifacts:ro
+      # rw: worker writes registry/active_model.json and bootstrap snaps
+      - ./artifacts:/app/artifacts
       - ./train_data:/app/train_data:ro
       - ./data:/app/data
     environment:
@@ -33,7 +34,7 @@ services:
       WORKER_STATE_DIR: /app/data/worker_state
       DATABASE_URL: ${DATABASE_URL}
       RECOMMENDER_URL: http://recommender:8001
-      DB_POLL_INTERVAL_SECONDS: ${DB_POLL_INTERVAL_SECONDS:-30}
+      DB_POLL_INTERVAL_SECONDS: ${DB_POLL_INTERVAL_SECONDS:-1}
       RETRAIN_THRESHOLD: ${RETRAIN_THRESHOLD:-0}
       RETRAIN_CHECK_INTERVAL_SECONDS: ${RETRAIN_CHECK_INTERVAL_SECONDS:-60}
       # Recommender restores vectors from ./data; skip 12k-user bulk push on every container start
