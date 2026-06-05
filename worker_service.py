@@ -36,7 +36,7 @@ from worker_db import (
     fetch_interaction_count,
     fetch_user_rating_snapshot,
     fetch_user_ratings,
-    fetch_users_with_new_ratings,
+    fetch_users_with_changed_ratings,
     load_external_item_map,
 )
 
@@ -132,8 +132,7 @@ class WorkerState:
         self.state_dir = Path(os.getenv("WORKER_STATE_DIR", "data/worker_state"))
         self.external_item_map: dict[str, int] = {}
         # In-memory only: no raw interactions persisted (vectors go to service_persistence).
-        self.poll_user_watermark: dict[str, datetime] = {}
-        self.pending_user_updated: dict[str, datetime] = {}
+        self.last_refreshed_fingerprint: dict[str, str] = {}
         self.retrain_interaction_checkpoint: int = 0
 
     def load_catalog(self, artifact_dir: str | Path | None = None) -> PlotwiseItemCatalog:
@@ -350,26 +349,21 @@ async def process_refresh_user(
         raise RuntimeError("Plotwise item catalog is not loaded.")
 
     user_id = str(user_id)
-    raw_ratings, max_updated = await asyncio.to_thread(fetch_user_rating_snapshot, user_id)
+    raw_ratings, _max_updated, fingerprint = await asyncio.to_thread(fetch_user_rating_snapshot, user_id)
     if not raw_ratings:
         log.debug("refresh skip user_id=%s: no ratings", user_id)
         return "no_ratings"
 
     async with state.lock:
         existing = state.user_vectors.get(user_id)
-        since = state.poll_user_watermark.get(user_id)
-        ratings_current = (
-            existing is not None
-            and max_updated is not None
-            and since is not None
-            and max_updated <= since
-        )
+        stored_fingerprint = state.last_refreshed_fingerprint.get(user_id)
+        ratings_current = existing is not None and stored_fingerprint == fingerprint
 
     if ratings_current:
         async with state.lock:
             record = state.user_vectors[user_id]
         if recommender_updated_at and recommender_updated_at == record.updated_at:
-            log.debug("refresh unchanged user_id=%s", user_id)
+            log.debug("refresh unchanged user_id=%s fingerprint=%s", user_id, fingerprint[:8])
             return "unchanged"
         await push_user_vector(client, user_id, record)
         log.info("refresh pushed existing vector user_id=%s", user_id)
@@ -414,11 +408,10 @@ async def process_refresh_user(
     )
     async with state.lock:
         state.user_vectors[user_id] = record
-        if max_updated is not None:
-            state.poll_user_watermark[user_id] = max_updated
-            state.pending_user_updated.pop(user_id, None)
+        state.last_refreshed_fingerprint[user_id] = fingerprint
     state.persist_user_vectors()
     await push_user_vector(client, user_id, record)
+    log.info("refresh recomputed user_id=%s fingerprint=%s", user_id, fingerprint[:8])
     return "ok"
 
 
@@ -448,11 +441,6 @@ async def refresh_worker_loop() -> None:
                 result = await process_refresh_user(user_id, client)
                 if result == "ok":
                     log.info("refresh ok user_id=%s pushed to recommender", user_id)
-                async with state.lock:
-                    if result in ("ok", "no_ratings", "no_usable_ratings"):
-                        ts = state.pending_user_updated.pop(user_id, None)
-                        if ts is not None:
-                            state.poll_user_watermark[user_id] = ts
             except Exception as exc:
                 log.warning("refresh failed user_id=%s: %s", user_id, exc)
             finally:
@@ -504,19 +492,16 @@ async def db_poll_loop() -> None:
     while not state.stop_event.is_set():
         try:
             async with state.lock:
-                watermarks = dict(state.poll_user_watermark)
+                fingerprints = dict(state.last_refreshed_fingerprint)
             pending = await asyncio.to_thread(
-                fetch_users_with_new_ratings,
-                last_refreshed_by_user=watermarks,
+                fetch_users_with_changed_ratings,
+                last_fingerprint_by_user=fingerprints,
                 limit=DB_POLL_LIMIT,
             )
             queued = 0
-            for user_id, updated_at in pending:
+            for user_id in pending:
                 if await enqueue_refresh_user(user_id):
                     queued += 1
-                    if updated_at is not None:
-                        async with state.lock:
-                            state.pending_user_updated[user_id] = updated_at
             if queued:
                 log.info("db poll: queued %s user(s) for refresh", queued)
         except Exception as exc:
