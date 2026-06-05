@@ -811,6 +811,7 @@ async def recommend_readiness(user_id: str) -> dict[str, Any]:
         "rating_count": rating_count,
         "has_ratings": rating_count > 0,
         "has_vector": has_vector,
+        "rated_item_ids": [str(item_id) for item_id, _ in ratings],
     }
 
 

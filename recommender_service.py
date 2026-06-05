@@ -111,6 +111,24 @@ class UserVectorRecord:
     updated_at: str
 
 
+def _mask_excluded_item_ids(
+    catalog: PlotwiseItemCatalog,
+    scores: np.ndarray,
+    excluded_item_ids: set[str],
+) -> None:
+    """Zero out all catalog rows that resolve to an excluded public item_id."""
+    if not excluded_item_ids:
+        return
+    for idx in range(len(catalog.item_ids)):
+        public_id = catalog.public_item_id_at(idx)
+        if public_id is not None and public_id in excluded_item_ids:
+            scores[idx] = -np.inf
+    for item_id in excluded_item_ids:
+        idx = catalog.item_id_to_idx.get(str(item_id))
+        if idx is not None:
+            scores[idx] = -np.inf
+
+
 class RecommenderState:
     def __init__(self) -> None:
         self._lock = RLock()
@@ -238,7 +256,12 @@ class RecommenderState:
         self.persist_user_vectors()
         return applied, rejected
 
-    def recommend(self, request: RecommendRequest) -> RecommendResponse:
+    def recommend(
+        self,
+        request: RecommendRequest,
+        *,
+        excluded_item_ids: set[str] | None = None,
+    ) -> RecommendResponse:
         with self._lock:
             catalog = self.catalog
             if catalog is None:
@@ -249,13 +272,10 @@ class RecommenderState:
 
             scores = catalog.global_mean + catalog.item_factors @ record.vector
             scores = scores.copy()
-            seen_indices = [
-                catalog.item_id_to_idx[str(item_id)]
-                for item_id in request.seen_item_ids
-                if str(item_id) in catalog.item_id_to_idx
-            ]
-            if seen_indices:
-                scores[seen_indices] = -np.inf
+            exclude = {str(item_id) for item_id in request.seen_item_ids}
+            if excluded_item_ids:
+                exclude.update(str(item_id) for item_id in excluded_item_ids)
+            _mask_excluded_item_ids(catalog, scores, exclude)
 
             ranked_idx = np.argsort(-scores)
             items: list[RecommendItem] = []
@@ -419,16 +439,22 @@ def _recommender_has_vector(user_id: str) -> bool:
         return user_id in state.user_vectors
 
 
-async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = False) -> bool:
+async def ensure_user_vector_via_worker(
+    user_id: str,
+    *,
+    force_push: bool = False,
+    rated_item_ids: list[str] | None = None,
+) -> tuple[bool, list[str]]:
     """Ask Worker to ensure vector is current and sync into this Recommender.
 
-    Returns True when the user vector is ready in this service; False otherwise
-    (reason logged — caller should return an empty recommend list).
+    Returns ``(ready, rated_item_ids)`` when the user vector is ready; otherwise
+    ``(False, rated_item_ids)`` (reason logged — caller should return empty items).
     """
     base = WORKER_URL.rstrip("/")
     timeout = httpx.Timeout(WORKER_REQUEST_TIMEOUT)
     last_error: str | None = None
     recommender_updated_at = None if force_push else _recommender_vector_updated_at(user_id)
+    known_rated_item_ids = list(rated_item_ids or [])
 
     for attempt in range(1, WORKER_CONNECT_RETRIES + 1):
         try:
@@ -436,6 +462,10 @@ async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = Fals
                 readiness = await client.get(f"{base}/v1/internal/users/{user_id}/recommend-readiness")
                 readiness.raise_for_status()
                 snapshot = readiness.json()
+                if not known_rated_item_ids:
+                    known_rated_item_ids = [
+                        str(item_id) for item_id in snapshot.get("rated_item_ids") or []
+                    ]
                 if not snapshot.get("has_ratings"):
                     _log_empty_recommend(
                         user_id,
@@ -443,7 +473,7 @@ async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = Fals
                         "нет оценок",
                         rating_count=int(snapshot.get("rating_count") or 0),
                     )
-                    return False
+                    return False, known_rated_item_ids
 
                 refresh = await client.post(
                     f"{base}/v1/internal/users/{user_id}/refresh-now",
@@ -457,7 +487,7 @@ async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = Fals
                 "worker_error",
                 f"worker HTTP {exc.response.status_code}",
             )
-            return False
+            return False, known_rated_item_ids
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             last_error = str(exc)
             log.warning(
@@ -471,12 +501,12 @@ async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = Fals
                 await asyncio.sleep(WORKER_CONNECT_RETRY_DELAY)
                 continue
             _log_empty_recommend(user_id, "worker_unavailable", last_error)
-            return False
+            return False, known_rated_item_ids
         except httpx.TimeoutException as exc:
             last_error = str(exc)
             log.warning("Worker timeout user_id=%s: %s", user_id, exc)
             _log_empty_recommend(user_id, "worker_unavailable", last_error)
-            return False
+            return False, known_rated_item_ids
 
         refresh_status = str(result.get("refresh_status") or "")
         if refresh_status == "no_ratings":
@@ -486,7 +516,7 @@ async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = Fals
                 "нет оценок",
                 rating_count=int(result.get("rating_count") or 0),
             )
-            return False
+            return False, known_rated_item_ids
         if refresh_status not in ("ok", "pushed", "unchanged") or not result.get("has_vector"):
             _log_empty_recommend(
                 user_id,
@@ -495,7 +525,7 @@ async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = Fals
                 rating_count=int(result.get("rating_count") or 0),
                 refresh_status=refresh_status,
             )
-            return False
+            return False, known_rated_item_ids
         worker_updated_at = result.get("worker_updated_at")
         local_updated_at = _recommender_vector_updated_at(user_id)
         log.info(
@@ -514,7 +544,11 @@ async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = Fals
                 "Recommender vector version lags worker user_id=%s; forcing push",
                 user_id,
             )
-            return await ensure_user_vector_via_worker(user_id, force_push=True)
+            return await ensure_user_vector_via_worker(
+                user_id,
+                force_push=True,
+                rated_item_ids=known_rated_item_ids,
+            )
         if not _recommender_has_vector(user_id):
             if not force_push:
                 log.warning(
@@ -522,7 +556,11 @@ async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = Fals
                     user_id,
                     refresh_status,
                 )
-                return await ensure_user_vector_via_worker(user_id, force_push=True)
+                return await ensure_user_vector_via_worker(
+                    user_id,
+                    force_push=True,
+                    rated_item_ids=known_rated_item_ids,
+                )
             _log_empty_recommend(
                 user_id,
                 "vector_sync_failed",
@@ -530,33 +568,43 @@ async def ensure_user_vector_via_worker(user_id: str, *, force_push: bool = Fals
                 refresh_status=refresh_status,
                 worker_updated_at=worker_updated_at,
             )
-            return False
-        return True
+            return False, known_rated_item_ids
+        return True, known_rated_item_ids
 
     _log_empty_recommend(user_id, "worker_unavailable", last_error or "unknown")
-    return False
+    return False, known_rated_item_ids
 
 
 @app.post("/v1/recommend", response_model=RecommendResponse)
 async def recommend(request: RecommendRequest, http_request: Request) -> RecommendResponse:
     user_id = str(request.user_id)
     http_request.state.recommend_user_id = user_id
-    if not await ensure_user_vector_via_worker(user_id):
+    ready, rated_item_ids = await ensure_user_vector_via_worker(user_id)
+    if not ready:
         return EMPTY_RECOMMEND_RESPONSE
+    excluded_item_ids = set(rated_item_ids)
     try:
-        response = state.recommend(request)
+        response = state.recommend(request, excluded_item_ids=excluded_item_ids)
         if not response.items and _recommender_has_vector(user_id):
             log.warning(
-                "POST /v1/recommend: zero scored items user_id=%s n=%s seen=%s",
+                "POST /v1/recommend: zero scored items user_id=%s n=%s excluded=%s",
                 user_id,
                 request.n,
-                len(request.seen_item_ids),
+                len(excluded_item_ids),
             )
         return response
     except UserNotReadyError:
-        if await ensure_user_vector_via_worker(user_id, force_push=True):
+        ready, rated_item_ids = await ensure_user_vector_via_worker(
+            user_id,
+            force_push=True,
+            rated_item_ids=rated_item_ids,
+        )
+        if ready:
             try:
-                return state.recommend(request)
+                return state.recommend(
+                    request,
+                    excluded_item_ids=set(rated_item_ids),
+                )
             except UserNotReadyError:
                 pass
         _log_empty_recommend(
