@@ -45,6 +45,9 @@ services:
       WORKER_URL: http://worker:8002
       RECOM_SYNC_FROM_WORKER_ON_START: "0"
       PLOTWISE_ITEM_DATA_DIR: /app/data/plotwise_item_data
+    networks:
+      - default
+      - plotwise
 
 networks:
   plotwise:
